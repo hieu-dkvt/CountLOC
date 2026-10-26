@@ -1,0 +1,13 @@
+# Bảng gộp account thủ công — sao chép thành identities.yaml và chỉnh.
+# Ưu tiên cao nhất (trước .mailmap, GitHub API, email).
+# Mỗi mục: account (bắt buộc) và email và/hoặc name.
+# - email: so khớp không phân biệt hoa thường.
+# - name: chỉ dùng khi commit không khớp mục nào theo email.
+# Một email (hoặc một tên) chỉ được gán cho một account.
+identities:
+  - email: alice@corp.com
+    account: alice
+  - email: 12345+alice@users.noreply.github.com
+    account: alice
+  - name: "Alice Nguyen"
+    account: alice

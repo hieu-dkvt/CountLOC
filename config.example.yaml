@@ -1,0 +1,29 @@
+# Cấu hình LOC Counter — sao chép thành config.yaml và chỉnh theo nhu cầu.
+# Key nào có trong file sẽ THAY THẾ hoàn toàn giá trị mặc định (list không gộp).
+
+# Thư mục bị loại ở mọi độ sâu (so khớp đúng tên, phân biệt hoa thường).
+exclude_dirs: [node_modules, vendor, dist, build, out, target, .venv, venv, __pycache__, .git, third_party, bin, obj]
+
+# Mẫu tên file bị loại (pattern có "/" thì so với cả đường dẫn).
+exclude_globs: ["*.min.js", "*.min.css", "*.map", "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "*.pb.go", "*_generated.*", "*.designer.cs"]
+
+# Loại file binary khỏi export ở chế độ full (file binary không bao giờ được đếm).
+exclude_binary: true
+
+# Bỏ qua file lớn hơn giá trị này (KB) và ghi cảnh báo.
+max_file_size_kb: 1024
+
+# false: bỏ test/, tests/, *_test.*, *.spec.*, *.test.*
+include_tests: true
+
+# true: tính docstring Python là code (JSDoc/Javadoc luôn là comment).
+count_docstrings: false
+
+# source_only | full (full: export mọi file, nhưng chỉ đếm file source)
+export_mode: source_only
+
+# Tên lexer Pygments không được coi là source.
+exclude_languages: ["Text only", "Markdown", "reStructuredText"]
+
+# Múi giờ mặc định cho thời điểm start/end.
+timezone: Asia/Bangkok
