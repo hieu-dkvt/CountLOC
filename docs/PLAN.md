@@ -17,7 +17,7 @@ UI (app.py) ──┘     │                   └─> counter.py ─> classifi
 config.py: cấu hình + mặc định, dùng chung.
 ```
 
-Thư mục project code: `Countloc/` (tương ứng `loc-counter/` mục 5). Package `loc_counter`, src layout.
+Thư mục project code: thư mục gốc repo (tương ứng `loc-counter/` mục 5). Package `loc_counter`, src layout.
 
 ## 2. Milestone và feature
 
@@ -166,7 +166,7 @@ Việc không cần spec:
 - README: lệnh `analyze`, danh sách file đầu ra, `run.log`, ý nghĩa và giới hạn kiểm tra chéo (D38, D40-N6), cảnh báo giải nén trên Windows (F9), CSV với locale dùng `;`, cảnh báo `MULTI_USER_HUNK` khi C_START rỗng (N23).
 - Cập nhật `.claude/skills/feature-test/mandatory-tests.md` mục E: `run.log` ở `<out>/run.log`; so sánh tái lập loại `manifest.json` (chỉ khác `generated_at`) và `run.log`.
 
-Tiêu chí hoàn thành (§13 + mandatory-tests mục E), chạy trong `Countloc/`:
+Tiêu chí hoàn thành (§13 + mandatory-tests mục E), chạy trong thư mục gốc repo:
 1. `uv run pytest -q` pass toàn bộ; `uv run ruff check src tests` sạch; coverage `counter`, `report`, `pipeline` ≥ 90 % (`uv run pytest --cov=loc_counter --cov-report=term-missing`).
 2. Repo §14 + `identities.yaml`: `uv run loc-counter analyze --repo <src> --branch main --start 2026-01-01 --end 2026-01-31 --out <tmp>` với: không `--user` → 10/20; `--user alice` → 10/13; `--user bob` → 10/17; `--user alice --user bob` (có và không `--separate-users`) → 10/20. alice `5/2/+3`, bob `8/1/+7`. `cross_check.diff_percent == 0`, không có cảnh báo `cross_check`. Thư mục `repo_main_2026-01-01_2026-01-31_{all|alice|bob|multi-2users}`.
 3. Đủ file §12: `start_2026-01-01_<sha7>.zip`, `end_2026-01-31_<tag>.zip` (+ zip riêng), `loc_report.xlsx` với `sheetnames == [Tong_quan, Theo_ngon_ngu, Theo_user, Theo_file, Theo_tuan, Canh_bao]`, 3 CSV bắt đầu `EF BB BF`, `warnings.csv`, `manifest.json` đủ key §12; `<out>/run.log`.
@@ -189,7 +189,7 @@ Phân tích `spec-analyst` 2026-10-25 (streamlit 1.66.1, pandas 3.1.0 trong `uv.
 
 Cấu trúc `app.py`: hàm thuần (không gọi `st.*`) ở mức module, test bằng pytest thường; giao diện trong `main()`, cuối file `if __name__ == "__main__": main()`; trạng thái chung tiến trình (khóa `out_root`, khóa cache repo) qua `@st.cache_resource` (biến toàn cục của script bị tạo lại mỗi rerun).
 
-Tiêu chí hoàn thành M6 (chạy trong `Countloc/`):
+Tiêu chí hoàn thành M6 (chạy trong thư mục gốc repo):
 1. `uv run pytest -q` pass toàn bộ; `uv run ruff check src tests` sạch; coverage `app.py` ≥ 85 % (`uv run pytest --cov=loc_counter --cov-report=term-missing`).
 2. `uv run pytest tests/test_app_input.py tests/test_app_result.py tests/test_app_identity.py -q` pass, gồm E2E AppTest trên repo §14: tất cả 10/20, alice 10/13, bob 10/17, alice+bob có xuất riêng 10/20 với 3 zip end; alice `5/2/+3`, bob `8/1/+7`.
 3. "Tải được mọi file": với mỗi E2E, tập tên file của `download_items(result)` = `os.listdir(out_dir)`, bytes khớp, AppTest có đủ nút tải tương ứng (không disabled).
