@@ -638,3 +638,29 @@ def test_attribution_mode_radio(make_app, s14: Path, with_ids: Path, tmp_path: P
     assert result.data.options.attribution_mode == "last_commit"
     assert (result.data.loc_start, result.data.loc_end) == (10, 20)
     assert app.STALE_NOTE not in values(at.info)
+
+
+# ---------- TC-26: cách tính LOC end ----------
+def test_loc_end_mode_radio(make_app, s14: Path, with_ids: Path, tmp_path: Path) -> None:
+    """TC-screen-input-26: radio cách tính LOC end — mặc định, build_request, kết quả cũ, khóa."""
+    modes = app.LOC_END_MODES
+    assert modes == ("Theo code ròng (đếm trên export)",
+                     "Theo code thêm (LOC start + tổng code thêm)")
+    common: dict[str, Any] = dict(branch="main", period=None, config=AppConfig(),
+                                  out_root=tmp_path, user_mode="Tất cả user", selected=set(),
+                                  exclude_bots=False, separate_users=False)
+    assert app.build_request(**common).loc_end_mode == "net_code"
+    assert app.build_request(**common, loc_end_mode=modes[1]).loc_end_mode == "added_code"
+
+    at = load(make_app(), s14)
+    assert at.radio(key="loc_end_mode").value == modes[0]
+    analyze(at)
+    assert at.session_state["result"].data.options.loc_end_mode == "net_code"
+    at.radio(key="loc_end_mode").set_value(modes[1]).run()
+    assert app.STALE_NOTE in values(at.info)
+    analyze(at)
+    assert not at.exception and not at.error
+    data = at.session_state["result"].data
+    assert data.options.loc_end_mode == "added_code"
+    assert (data.loc_end, data.reported_loc_end) == (20, 23)
+    assert app.STALE_NOTE not in values(at.info)

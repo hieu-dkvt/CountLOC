@@ -59,11 +59,13 @@ Export end khi chọn một hoặc vài user = source tại C_START + **chỉ** 
 uv run loc-counter analyze --repo <URL hoặc đường dẫn> --start 2026-01-01 --end 2026-01-31 \
   --out ./out [--branch main] [--start-time HH:MM] [--end-time HH:MM] [--tz Asia/Bangkok] \
   [--user alice --user bob] [--separate-users] [--exclude-bots] [--attribution line|last-commit] \
-  [--config config.yaml] [--identities identities.yaml] [--token-env GITHUB_TOKEN] [--json]
+  [--loc-end net|added] [--config config.yaml] [--identities identities.yaml] \
+  [--token-env GITHUB_TOKEN] [--json]
 ```
 - Không có `--user` = **Tất cả user** (export end = C_END). Nhiều `--user` = một bản gộp các user đó; `--separate-users` thêm một zip riêng cho từng user.
 - `--user` khớp chính xác account, nếu không có thì khớp không phân biệt hoa thường (khi chỉ có đúng một account khớp). Bot được chọn tường minh vẫn được tính dù có `--exclude-bots`; `--exclude-bots` chỉ loại bot khỏi "Tất cả user".
 - `--attribution` chọn cách gán tác giả (cũng là radio "Cách gán tác giả" ở giao diện web): `line` (mặc định) gán từng dòng thêm/xóa cho người viết/xóa dòng đó bằng `git blame`; `last-commit` đơn giản và nhanh hơn: **toàn bộ** thay đổi của một file trong kỳ (dòng thêm, dòng xóa) và bản C_END của file thuộc về **người sửa cuối cùng** file đó. Với `last-commit`, chọn user A chỉ có các file mà A sửa cuối; file người khác sửa cuối giữ bản C_START. Lựa chọn được ghi ở `manifest.json` (`options.attribution_mode`) và sheet `Tong_quan`.
+- `--loc-end` chọn cách tính LOC end (cũng là radio "Cách tính LOC end" ở giao diện web): `net` (mặc định) đếm LOC trên bản export end, xấp xỉ LOC start + tổng code ròng (code thêm − code xóa); `added` báo LOC end = LOC start + **tổng code thêm** (không trừ code xóa — đo khối lượng code viết thêm). Với `added`, LOC đếm trên export vẫn được ghi (hàng `LOC end đếm trên export`; `manifest.json` giữ `totals.loc_end` là LOC đếm trên export, LOC end theo cách tính đã chọn ở `totals.reported_loc_end`) và kiểm tra chéo vẫn so với LOC đếm trên export; bảng theo ngôn ngữ / theo file luôn đếm trên export. Bảng tổng (stdout, sheet `Tong_quan`, `manifest.json` `totals`, màn hình kết quả) luôn có thêm tổng code thêm và tổng code xóa.
 - Tiến độ (`[1/5] Export start…` … `[5/5] Tạo báo cáo…`) và log in ra stderr; stdout là bảng tóm tắt, hoặc JSON khi có `--json`.
 - Mã thoát: `0` thành công (kể cả có cảnh báo hay kiểm tra chéo lệch), `1` lỗi (thông báo tiếng Việt), `2` sai tham số, `130` khi bấm Ctrl+C.
 
@@ -74,8 +76,8 @@ Mỗi lần chạy ghi thư mục `<out>/<repo>_<nhánh>_<start>_<end>_<user-tag
 |---|---|
 | `start_<ngày>_<sha7>.zip` | source tại C_START sau bộ lọc (`..._empty.zip` khi không có commit trước start) |
 | `end_<ngày>_<user-tag>.zip` | export end (và zip riêng từng user nếu `--separate-users`) |
-| `loc_report.xlsx` | sheet `Tong_quan`, `Theo_ngon_ngu`, `Theo_user`, `Theo_file`, `Theo_tuan`, `Canh_bao` |
-| `loc_by_user.csv`, `loc_by_language.csv`, `loc_by_file.csv` | UTF-8 có BOM, phân cách `,` |
+| `loc_report.xlsx` | sheet `Tong_quan`, `Theo_ngon_ngu`, `Theo_user`, `Theo_file`, `Theo_tuan`, `Theo_PR`, `Canh_bao` |
+| `loc_by_user.csv`, `loc_by_language.csv`, `loc_by_file.csv`, `loc_by_pr.csv` | UTF-8 có BOM, phân cách `,` |
 | `warnings.csv` | mọi cảnh báo, kèm phạm vi (`start`, `end:<tag>`, `gán tác giả`, `kiểm tra chéo`, `định danh`) |
 | `manifest.json` | tham số, commit C_START / C_END, cấu hình đã dùng, tổng LOC, kiểm tra chéo, danh sách zip |
 
@@ -86,6 +88,12 @@ Mỗi lần chạy ghi thư mục `<out>/<repo>_<nhánh>_<start>_<end>_<user-tag
 - Cùng repo, nhánh, kỳ, user và cấu hình → mọi file trong thư mục kết quả giống hệt nhau từng byte, trừ `generated_at` trong `manifest.json`.
 - Excel với locale dùng `;` làm phân cách (vd. tiếng Việt, Đức) có thể mở CSV thành một cột: dùng `Data → From Text/CSV` và chọn phân cách `,`, hoặc mở `loc_report.xlsx`.
 - Trên Windows chưa bật long path, đường dẫn kết quả dài hơn 259 ký tự bị từ chối trước khi phân tích: chọn `--out` ngắn hơn.
+
+### LOC theo PR của từng user
+Sheet `Theo_PR` và `loc_by_pr.csv` thống kê **commit, code thêm, code xóa, code ròng** theo từng cặp (PR, user); màn hình kết quả có mục "Theo PR của từng user". Cùng định nghĩa với bảng theo user (§8.2): với mỗi user, tổng các dòng PR = số liệu ở `Theo_user`.
+- **PR được nhận diện từ lịch sử git**, không gọi GitHub API: (1) merge commit `Merge pull request #N from …` — PR gồm các commit của nhánh được merge và chính merge commit (tiêu đề = dòng đầu của nội dung merge commit); (2) commit squash có đuôi `(#N)` ở tiêu đề (`Thêm login (#12)`) — PR là chính commit đó; (3) commit còn lại (push thẳng, rebase-merge không có `#N`, merge kiểu GitLab…) thuộc nhóm **"(Không thuộc PR)"**.
+- PR chỉ được tính khi merge / squash commit nằm trong kỳ. PR lồng nhau (PR vào nhánh, nhánh vào PR khác) → commit thuộc PR trong cùng nhất. Ngày merge = author date của merge / squash commit theo múi giờ đã chọn.
+- Dòng do merge commit giải quyết xung đột được tính cho PR của merge đó (§16); dòng xóa tính cho PR chứa commit đã xóa dòng.
 
 ### Kiểm tra chéo
 `loc_start + Σ code ròng của các user được tính ≈ loc_end`. Lệch quá 0.5 % (so với `loc_end`) → cảnh báo `cross_check` (không phải lỗi). Lệch là **đúng theo định nghĩa** khi trong kỳ có thay đổi không được gán cho dòng nào, ví dụ:

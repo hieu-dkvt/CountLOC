@@ -7,7 +7,7 @@ modules: [src/loc_counter/counter.py]
 tests: [tests/test_counter.py, tests/test_counter_metrics.py]
 spec_refs: ["3.3", "3.4", "6.3", "7.2", "7.3", "7.4", "7.5", "8.1", "8.2", "8.3", "9", "10.3", "12", "15", "16"]
 depends_on: [config, filters, classifier, attribution, builder, identity]
-status: implemented
+status: reviewed
 ---
 
 # Đếm LOC và số liệu
@@ -206,6 +206,36 @@ def weekly_metrics(attribution: PeriodAttribution, commits: Sequence[LogCommit],
                    accounts: Collection[str], timezone: str) -> list[WeekRow]:
     """Code ròng theo tuần ISO (author date) cho từng account (D35); sắp (week_start, account)."""
 
+# ----- M8 (D43): theo PR -----
+NO_PR_LABEL = "(Không thuộc PR)"
+
+@dataclass(frozen=True)
+class PrRef:
+    number: int
+    title: str
+    merge_sha: str             # merge commit "Merge pull request #N" hoặc commit squash "(#N)"
+    merged_at: datetime        # author date của merge_sha, aware
+
+@dataclass(frozen=True)
+class PrRow:
+    pr: int | None             # None = nhóm "Không thuộc PR"
+    title: str                 # "" khi pr là None
+    merge_sha: str             # "" khi pr là None
+    merged_at: datetime | None # quy về múi giờ đã chọn; None khi pr là None
+    account: str
+    commits: int               # commit không phải merge
+    added_code: int
+    deleted_code: int
+    @property
+    def net_code(self) -> int: ...
+
+def pr_membership(commits: Sequence[LogCommit]) -> dict[str, PrRef]:
+    """commit sha → PR chứa nó (chỉ commit thuộc một PR; commit khác không có khóa)."""
+
+def pr_metrics(attribution: PeriodAttribution, commits: Sequence[LogCommit],
+               accounts: Collection[str], timezone: str) -> list[PrRow]:
+    """LOC theo (PR, account) (D43); sắp (PR tăng dần, account), nhóm không thuộc PR cuối."""
+
 CROSS_CHECK_THRESHOLD_PERCENT = 0.5
 
 @dataclass(frozen=True)
@@ -357,6 +387,24 @@ Không kiểm lại binary / bộ lọc đường dẫn: `language` đã là k�
 
 `cross_check_warning(check, tag)`: `check.ok` → `None`; ngược lại `LocWarning(CROSS_CHECK, "", f"Kiểm tra chéo ({tag}): loc_start {loc_start} + tổng code ròng {sum_net_code:+d} = {expected_loc_end}, loc_end = {loc_end}, lệch {diff_percent:.3f}% (ngưỡng {threshold_percent}%)")`.
 
+### 5.10 `pr_membership`, `pr_metrics` (M8, D43)
+Chỉ dùng dữ liệu đã có (`commits` = `log_commits`, `attribution.commit_stats`); không gọi git. Tập `commits` là đồ thị của kỳ: cha nằm ngoài `commits` (tổ tiên của C_START) bị bỏ qua.
+
+`pr_membership(commits)`:
+1. Nhận diện PR:
+   - **Merge PR:** commit có ≥ 2 parent và `subject` khớp `^Merge pull request #(\d+)\b` → PR `N`, `title = body_title` (rỗng → phần sau `from ` của subject, vẫn rỗng → `subject`).
+   - **Squash:** commit (bất kể số parent) có `subject` khớp `\(#(\d+)\)\s*$` và **không** phải merge PR → PR `N`, `title = subject` bỏ đuôi ` (#N)` và `strip()`. `Revert "… (#12)"` không khớp (kết thúc bằng `")`).
+2. Thành viên của merge PR `M` = `anc(M.parents[1]) \ anc(M.parents[0])` ∪ `{M}`, trong đó `anc(x)` = x và mọi tổ tiên của x **nằm trong `commits`**. Cài đặt: duyệt đồ thị theo thứ tự tô-pô (cha trước con; không dựa vào thứ tự `git log`), `anc` là bitset `int` theo chỉ số commit. Merge ≥ 3 parent: lấy mọi parent từ thứ hai trở đi.
+3. Gán: duyệt merge PR theo `(số thành viên, merge_sha)` tăng dần; mỗi thành viên **chưa được gán** nhận `PrRef(N, title, M.sha, M.author_date)` — PR lồng nhau: PR trong cùng nhất thắng (Q50). Sau đó mỗi commit squash **chưa được gán** nhận `PrRef` của chính nó. Commit còn lại không có khóa.
+4. Hai PR trùng số `N` (hiếm: merge lại sau revert, repo gộp từ fork): `pr_metrics` gộp theo `N`, lấy `title`, `merge_sha`, `merged_at` của PR có `(merged_at, merge_sha)` nhỏ nhất.
+
+`pr_metrics(attribution, commits, accounts, timezone)`:
+1. `membership = pr_membership(commits)`; khóa PR của một sha = `ref.number` nếu có, ngược lại `None`.
+2. Đếm commit: mỗi `c` trong `commits` **không phải merge** có `attribution.commit_accounts.get(c.sha) in accounts` → ô `(PR của c.sha, account)`: `commits += 1`.
+3. Dòng code: mỗi `s` trong `attribution.commit_stats` có `s.account in accounts` → ô `(PR của s.sha, s.account)`: `added_code += s.added_code`, `deleted_code += s.deleted_code`. `s.sha` không có trong `commits` → vào nhóm không thuộc PR (khác `weekly_metrics`: ở đây không cần ngày nên không bỏ dòng, để giữ bất biến Σ). Dòng giải quyết xung đột của merge PR `M` được tính cho PR của `M`.
+4. Chỉ giữ ô có `commits`, `added_code` hoặc `deleted_code` khác 0. `merged_at` = `ref.merged_at.astimezone(ZoneInfo(timezone))`.
+5. Sắp: PR có số tăng dần (theo account tăng dần), nhóm `pr is None` cuối (theo account). Bất biến: với mỗi account, Σ `added_code` / `deleted_code` / `commits` trên mọi dòng = `UserMetrics` tương ứng (TC-52).
+
 ## 6. Quy tắc nghiệp vụ & trường hợp biên
 - Thứ tự kiểm tra: đường dẫn → ngôn ngữ (theo tên) → kích thước → binary → (cảnh báo ngôn ngữ). Nhờ vậy ảnh `.png` báo là `BINARY`, còn `LICENSE` báo `UNKNOWN_LANGUAGE`.
 - File thuộc `exclude_languages` (`.txt`, `.md`, `.rst`) không đếm và không cảnh báo (cấu hình chủ động).
@@ -450,6 +498,15 @@ M5 — file `tests/test_counter_metrics.py` (repo §14 = fixture `section14_repo
 | TC-counter-41 | `cross_check_warning` | check không ok, tag `alice`; check ok | `LocWarning(CROSS_CHECK, "", …)` tiếng Việt chứa `alice`, loc_start, giá trị kỳ vọng, loc_end, phần trăm; check ok → None | unit |
 | TC-counter-42 | Kiểm tra chéo lệch có cảnh báo (mandatory-tests D) | `make_repo`: start có `notes.txt` (5 dòng `x = 1`, bị loại theo `exclude_languages`); trong kỳ đổi tên 100 % → `notes.py`; export `all` | `loc_start 0`, `loc_end 5`, Σ net 0 → `ok False`, `diff_percent 100.0`; có cảnh báo `CROSS_CHECK` | integration |
 | TC-counter-43 | Tái lập | gọi mọi hàm M5 hai lần trên §14 | kết quả bằng nhau | integration |
+| TC-counter-45 | `pr_membership`: merge PR | đồ thị giả: `m1` ← `m2` (main), `f1` ← `f2` (nhánh từ `m1`), `M` = merge(`m2`, `f2`) subject `Merge pull request #7 from o/feat`, `body_title` `Thêm X`; cha gốc `p0` ngoài `commits` | `f1`, `f2`, `M` → `PrRef(7, "Thêm X", M, M.author_date)`; `m1`, `m2` không có khóa; `body_title` rỗng → title = `o/feat`; subject lạ + body rỗng → title = subject | unit |
+| TC-counter-46 | `pr_membership`: squash | commit `Thêm login (#12)`; `Revert "Thêm login (#12)"`; `fix (#12) typo`; `Thêm (#5)  ` (khoảng trắng cuối); commit `Merge branch 'x'` 2 parent (không PR) | chỉ commit 1 và 4 có khóa (số 12 và 5); title `Thêm login` / `Thêm`; merge không PR và commit nhánh của nó không có khóa | unit |
+| TC-counter-47 | PR lồng nhau và squash trong merge PR | PR #1: merge `M1` vào `B2`; PR #2: merge `M2` (main ← `B2`) nên tập thành viên chứa cả commit của #1; commit `c` trong nhánh #2 có subject `x (#9)` | commit/`M1` của #1 → PR 1 (nhỏ hơn thắng); commit riêng của B2 và `M2` → PR 2; `c` → PR 2 (merge PR thắng squash) | unit |
+| TC-counter-48 | `pr_membership`: thứ tự `git log` không tô-pô | cùng đồ thị TC-45 nhưng danh sách `commits` đảo thứ tự (cha trước con) và xáo trộn | cùng kết quả TC-45; đồ thị hỏng có vòng (commit là cha của chính nó, hai commit là cha của nhau) → không treo, bỏ cạnh vòng | unit |
+| TC-counter-49 | `pr_metrics`: nhóm theo (PR, account) | PR #7 (merge) gồm alice 2 commit, bob 1 commit, merge của carol có `commit_stats` added_code 1; PR #12 squash của alice; 1 commit trực tiếp của alice; mọi account | dòng đúng số commit/added/deleted từng (PR, account); carol: commits 0, added 1 ở PR 7; sắp PR 7, PR 12, rồi nhóm `None`; `merged_at` quy về `Asia/Bangkok` (offset +7); `net_code` đúng | unit |
+| TC-counter-50 | `pr_metrics`: lọc account, ô 0, sha lạ | `accounts` = [alice]; commit alice không có dòng code (chỉ commit); `commit_stats` của sha không có trong `commits` | bob không có dòng; ô chỉ-có-commit vẫn có (commits 1, 0/0); sha lạ vào nhóm `None`; ô toàn 0 bị bỏ | unit |
+| TC-counter-51 | `pr_metrics`: không có PR nào | chỉ commit thường | mọi dòng `pr is None`; bằng Σ theo account của `user_metrics` | unit |
+| TC-counter-52 | Tích hợp repo git thật: bất biến Σ | repo: `base` (trước kỳ); main: alice thêm 3 dòng; nhánh `feat` (từ base): bob thêm `b.py` 4 dòng + alice thêm 2 dòng; merge `--no-ff` với message `Merge pull request #7 from o/feat\n\nThêm b.py` (author carol); commit alice `Sửa lỗi (#9)` thêm 1 dòng; commit trực tiếp bob thêm 1 dòng | `pr_metrics`: PR 7 gồm alice (1 commit, 2 dòng) + bob (1 commit, 4 dòng); PR 9 alice 1 dòng; nhóm `None` gồm alice 3 dòng + bob 1 dòng; với mỗi account Σ theo `pr_metrics` = `user_metrics` (commits, added, deleted) | integration |
+| TC-counter-53 | Tái lập và hiệu năng đồ thị | gọi `pr_metrics` hai lần; đồ thị 3000 commit tuyến tính + 300 merge PR (giả) | kết quả bằng nhau; chạy dưới 5 giây | unit |
 | TC-counter-44 | Không import module phụ thuộc lúc chạy (D37) | tiến trình con: `import loc_counter.counter` rồi liệt kê `sys.modules` | không có `loc_counter.attribution`, `.builder`, `.identity`, `.git_repo`, `.snapshot` | unit |
 
 ## 10. Câu hỏi mở / giả định
@@ -486,3 +543,4 @@ M5 — file `tests/test_counter_metrics.py` (repo §14 = fixture `section14_repo
 | 2026-10-24 | Sửa theo review (reviews/counter-20261024.md, PASS_WITH_NOTES) — làm rõ, không đổi kết quả trên luồng chính: 5.4 đóng iterator khi có `close()` (Minor 2); 5.9 so ngưỡng bằng phân số chính xác (Minor 3); TC-25 thêm ca lỗi phía người đọc (Minor 1); `user_metrics` gom file một lượt (Minor 5). Minor 4 (`iso_week` nhận datetime naive) giữ nguyên: đầu vào luôn aware (`LogCommit.author_date`). Chốt theo khuyến nghị (người dùng ủy quyền) → `reviewed` | /feature-review |
 | 2026-10-30 | 5.7: `files` tính cả `granularity == "last"` (spec `attribution` 5.10); không đổi với mode `line` | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
 | 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | M8 (D43): thêm `PrRef`, `PrRow`, `NO_PR_LABEL`, `pr_membership`, `pr_metrics` (mục 3, 5.10); TC-45..53. Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | PLAN M8, D43 |

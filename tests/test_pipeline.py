@@ -69,7 +69,7 @@ BOT = "dependabot[bot]"
 ALICE = ("alice", "alice@example.com")
 FULL = FilterConfig(export_mode="full")
 REPORT_NAMES = ["loc_report.xlsx", "loc_by_user.csv", "loc_by_language.csv",
-                "loc_by_file.csv", "warnings.csv", "manifest.json"]
+                "loc_by_file.csv", "loc_by_pr.csv", "warnings.csv", "manifest.json"]
 ALL_DIR = "repo_main_2026-01-01_2026-01-31_all"
 
 
@@ -271,8 +271,8 @@ def test_output_files(s14, tmp_path: Path) -> None:
                             *REPORT_NAMES])
     wb = load_workbook(r.out_dir / "loc_report.xlsx")
     assert wb.sheetnames == ["Tong_quan", "Theo_ngon_ngu", "Theo_user", "Theo_file",
-                             "Theo_tuan", "Canh_bao"]
-    for name in ("loc_by_user.csv", "loc_by_language.csv", "loc_by_file.csv"):
+                             "Theo_tuan", "Theo_PR", "Canh_bao"]
+    for name in ("loc_by_user.csv", "loc_by_language.csv", "loc_by_file.csv", "loc_by_pr.csv"):
         assert (r.out_dir / name).read_bytes().startswith(b"\xef\xbb\xbf")
     m = manifest_of(r.out_dir)
     for key in ("tool_version", "generated_at", "repo", "branch", "timezone", "start", "end",
@@ -840,7 +840,9 @@ def test_analysis_result(s14, tmp_path: Path) -> None:
     assert sorted(u.account for u in r.period_users) == ["alice", "bob"]
     assert r.generated_at == NOW
     m = manifest_of(r.out_dir)
-    assert m["totals"] == {"loc_start": 10, "loc_end": 20, "loc_delta": 10}
+    assert m["totals"] == {"loc_start": 10, "loc_end": 20, "loc_delta": 10,
+                           "added_code": 13, "deleted_code": 3, "net_code": 10,
+                           "reported_loc_end": 20, "reported_loc_delta": 10}
     assert [(e["file"], e["loc"]) for e in m["exports"]] == [
         (e.file_name, e.loc) for e in r.data.exports]
 
@@ -1203,3 +1205,77 @@ def test_attribution_mode_last_commit(s14, tmp_path: Path, monkeypatch: pytest.M
     assert len(spy.calls) == 2 and spy.calls[1][1]["mode"] == "last_commit"
     with pytest.raises(ValueError, match="attribution_mode"):
         run("bad", None, "x")
+
+
+# ---------- TC-41: cách tính LOC end ----------
+def test_loc_end_mode(s14, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-pipeline-41: loc_end_mode — net_code mặc định; added_code = 10 + 13; export không đổi."""
+    _, repo = s14()
+    ctx = prepare_period(repo, "main", jan(), AccountResolver(IDS))
+    resolver = AccountResolver(IDS)
+    spy = Spy(monkeypatch, pipeline, "attribute_period")
+
+    def run(out: str, mode: str | None) -> AnalysisResult:
+        extra = {} if mode is None else {"loc_end_mode": mode}
+        request = AnalysisRequest("main", jan(), AppConfig(), tmp_path / out, **extra)
+        with run_log(tmp_path / out):
+            return run_analysis(repo, request, resolver, context=ctx, now=lambda: NOW)
+
+    net = run("net", None)
+    assert net.data.options.loc_end_mode == "net_code"
+    assert (net.data.loc_end, net.data.reported_loc_end) == (20, 20)
+    added = run("added", "added_code")
+    assert len(spy.calls) == 1  # chỉ đổi cách tính LOC end → dùng lại kết quả gán tác giả
+    assert added.data.options.loc_end_mode == "added_code"
+    assert (added.data.loc_end, added.data.reported_loc_end) == (20, 23)
+    assert added.data.cross_check == net.data.cross_check and added.data.cross_check.ok
+    m = manifest_of(added.out_dir)
+    assert (m["totals"]["loc_end"], m["totals"]["reported_loc_end"],
+            m["totals"]["reported_loc_delta"]) == (20, 23, 13)
+    assert m["options"]["loc_end_mode"] == "added_code"
+    for name in [*(p.name for p in net.end_zips), net.start_zip.name, "loc_by_user.csv",
+                 "loc_by_language.csv", "loc_by_file.csv", "loc_by_pr.csv", "warnings.csv"]:
+        assert (hashlib.sha256((net.out_dir / name).read_bytes()).digest()
+                == hashlib.sha256((added.out_dir / name).read_bytes()).digest()), name
+    log = (tmp_path / "added" / "run.log").read_text(encoding="utf-8")
+    assert "LOC end theo code thêm: 10 + 13 = 23 (đếm trên export: 20)" in log
+    assert "LOC end theo code thêm" not in (tmp_path / "net" / "run.log").read_text(
+        encoding="utf-8")
+    with pytest.raises(ValueError, match="loc_end_mode"):
+        run("bad", "x")
+    assert not (tmp_path / "bad").exists() or not any(
+        p.is_dir() for p in (tmp_path / "bad").iterdir())
+
+
+def test_pr_stats_end_to_end(make_repo, cache_root: Path, tmp_path: Path) -> None:
+    """TC-pipeline-42: LOC theo PR — merge PR, squash, trực tiếp; file Theo_PR / loc_by_pr.csv."""
+    bob = ("bob", "bob@example.com")
+    src = make_repo()
+    base = src.commit("base", "2025-12-20T10:00:00+07:00", files={"app.py": "x0 = 0\n"})
+    src.git("checkout", "-q", "-b", "feat", base)
+    src.commit("bob b", "2026-01-03T10:00:00+07:00", author=bob,
+               files={"b.py": NL.join(f"b{i} = {i}" for i in range(4)) + NL})
+    src.commit("alice c", "2026-01-04T10:00:00+07:00", author=ALICE,
+               files={"c.py": "c1 = 1" + NL + "c2 = 2" + NL})
+    src.checkout("main")
+    src.commit("alice main", "2026-01-05T10:00:00+07:00", author=ALICE,
+               files={"app.py": NL.join(["x0 = 0", "a1 = 1", "a2 = 2", "a3 = 3"]) + NL})
+    src.merge("feat", "Merge pull request #7 from o/feat\n\nThêm b.py",
+              "2026-01-06T10:00:00+07:00", author=("carol", "carol@example.com"))
+    src.commit("Sửa lỗi (#9)", "2026-01-07T10:00:00+07:00", author=ALICE,
+               files={"d.py": "d1 = 1" + NL})
+
+    r = analyze(open_repo(src, cache_root), tmp_path / "out")
+    assert [(p.pr, p.account, p.commits, p.added_code, p.deleted_code)
+            for p in r.data.pr_rows] == [
+        (7, "alice", 1, 2, 0), (7, "bob", 1, 4, 0), (9, "alice", 1, 1, 0), (None, "alice", 1, 3, 0)]
+    assert "loc_by_pr.csv" in [p.name for p in r.report_files]
+    ws = load_workbook(r.out_dir / "loc_report.xlsx")["Theo_PR"]
+    sheet = list(ws.iter_rows(values_only=True))
+    assert len(sheet) == 5 and sheet[1][:5] == (7, "Thêm b.py", sheet[1][2], "2026-01-06", "alice")
+    for u in r.data.user_rows:      # bất biến: Σ theo PR = số liệu theo user
+        mine = [p for p in r.data.pr_rows if p.account == u.account]
+        assert (sum(p.commits for p in mine), sum(p.added_code for p in mine),
+                sum(p.deleted_code for p in mine)) == (u.commits, u.added_code, u.deleted_code)
+    again = analyze(open_repo(src, cache_root), tmp_path / "out2")
+    assert digests(again.out_dir)["loc_by_pr.csv"] == digests(r.out_dir)["loc_by_pr.csv"]

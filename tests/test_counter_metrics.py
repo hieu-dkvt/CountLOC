@@ -7,12 +7,12 @@ import subprocess
 import sys
 import zipfile
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
-from test_attribution import ALICE, BOB, A, B, j, prepare
+from test_attribution import ALICE, BOB, CAROL, A, B, j, prepare
 
 from loc_counter.attribution import (
     CommitLineStats,
@@ -33,6 +33,7 @@ from loc_counter.classifier import LineClassifier, content_sha1
 from loc_counter.config import FilterConfig
 from loc_counter.counter import (
     CROSS_CHECK_THRESHOLD_PERCENT,
+    NO_PR_LABEL,
     ContentFile,
     CountResult,
     CrossCheck,
@@ -40,6 +41,8 @@ from loc_counter.counter import (
     FileRow,
     LanguageRow,
     LocWarning,
+    PrRef,
+    PrRow,
     UserMetrics,
     WarningKind,
     WeekRow,
@@ -52,6 +55,8 @@ from loc_counter.counter import (
     cross_check_warning,
     is_countable,
     iso_week,
+    pr_membership,
+    pr_metrics,
     rename_map,
     total_metrics,
     user_metrics,
@@ -598,3 +603,224 @@ def test_no_runtime_import_of_dependents() -> None:
     for name in ("attribution", "builder", "identity", "git_repo", "snapshot"):
         assert f"loc_counter.{name}" not in out, name
     assert "loc_counter.counter" in out
+
+
+# ---------- TC-45 .. TC-53: theo PR (M8, D43) ----------
+def lc(ch: str, parents: tuple[str, ...] = (), subject: str = "", body_title: str = "",
+       email: str = A, when: str = "2026-01-06T10:00:00+07:00") -> LogCommit:
+    """LogCommit giả có parent và subject; sha = ch * 40."""
+    name = email.split("@")[0]
+    return LogCommit(sha(ch), tuple(parents), name, email, name, email,
+                     datetime.fromisoformat(when), subject, body_title)
+
+
+def _graph_pr7(**merge_kwargs: Any) -> list[LogCommit]:
+    """m1←m2 (main), f1←f2 (nhánh từ m1), M = merge(m2, f2) 'Merge pull request #7'."""
+    return [
+        lc("1", (sha("0"),)),
+        lc("2", (sha("1"),)),
+        lc("3", (sha("1"),)),
+        lc("4", (sha("3"),)),
+        lc("5", (sha("2"), sha("4")), **{"subject": "Merge pull request #7 from o/feat",
+                                         "body_title": "Thêm X", **merge_kwargs}),
+    ]
+
+
+def test_pr_membership_merge_pr() -> None:
+    """TC-counter-45: thành viên merge PR = M^2 trừ M^1 và M; title lấy từ body, 'from', subject."""
+    commits = _graph_pr7()
+    ref = PrRef(7, "Thêm X", sha("5"), commits[-1].author_date)
+    assert pr_membership(commits) == {sha("3"): ref, sha("4"): ref, sha("5"): ref}
+
+    no_body = pr_membership(_graph_pr7(body_title=""))
+    assert no_body[sha("5")].title == "o/feat"
+    odd = pr_membership(_graph_pr7(subject="Merge pull request #7", body_title=""))
+    assert odd[sha("5")].title == "Merge pull request #7"
+
+
+def test_pr_membership_squash() -> None:
+    """TC-counter-46: squash '(#N)' ở cuối subject; Revert/giữa subject không khớp."""
+    commits = [
+        lc("1", (sha("0"),), "Thêm login (#12)"),
+        lc("2", (sha("1"),), 'Revert "Thêm login (#12)"'),
+        lc("3", (sha("2"),), "fix (#12) typo"),
+        lc("4", (sha("3"),), "Thêm (#5)  "),
+        lc("5", (sha("0"),), "Việc trên nhánh"),
+        lc("6", (sha("4"), sha("5")), "Merge branch 'x'"),
+    ]
+    got = pr_membership(commits)
+    assert set(got) == {sha("1"), sha("4")}
+    assert (got[sha("1")].number, got[sha("1")].title) == (12, "Thêm login")
+    assert (got[sha("4")].number, got[sha("4")].title) == (5, "Thêm")
+    assert got[sha("1")].merge_sha == sha("1")
+
+
+def test_pr_membership_nested_and_squash_inside_merge() -> None:
+    """TC-counter-47: PR lồng nhau → PR trong cùng nhất; squash trong merge PR → merge PR thắng."""
+    commits = [
+        lc("1", (sha("0"),)),                                   # m1
+        lc("2", (sha("1"),)),                                   # b1 (nhánh B2)
+        lc("3", (sha("2"),)),                                   # g1 (PR #1)
+        lc("4", (sha("3"),)),                                   # g2
+        lc("5", (sha("2"), sha("4")), "Merge pull request #1 from o/a", "Một"),   # M1
+        lc("6", (sha("5"),)),                                   # b2
+        lc("7", (sha("6"),), "x (#9)"),                         # c — squash trong PR #2
+        lc("8", (sha("1"),)),                                   # m2 (main)
+        lc("9", (sha("8"), sha("7")), "Merge pull request #2 from o/b", "Hai"),   # M2
+    ]
+    got = pr_membership(commits)
+    assert {s: r.number for s, r in got.items()} == {
+        sha("3"): 1, sha("4"): 1, sha("5"): 1,
+        sha("2"): 2, sha("6"): 2, sha("7"): 2, sha("9"): 2}
+    assert sha("1") not in got and sha("8") not in got
+
+
+def test_pr_membership_ignores_log_order() -> None:
+    """TC-counter-48: kết quả không phụ thuộc thứ tự danh sách commit (cha trước con)."""
+    commits = _graph_pr7()
+    expected = pr_membership(commits)
+    assert pr_membership(list(reversed(commits))) == expected
+    shuffled = [commits[i] for i in (3, 0, 4, 2, 1)]
+    assert pr_membership(shuffled) == expected
+
+    # dữ liệu hỏng có vòng (git không tạo ra): không treo, bỏ cạnh vòng
+    loop = [lc("1", (sha("2"),)), lc("2", (sha("1"),)),
+            lc("3", (sha("3"), sha("2")), "Merge pull request #1 from o/x", "Một")]
+    assert set(pr_membership(loop)) == {sha("3")}
+
+
+def test_pr_metrics_groups_by_pr_and_account() -> None:
+    """TC-counter-49: nhóm (PR, account); merge carol góp dòng xung đột; quy về múi giờ đã chọn."""
+    commits = [
+        lc("1", (sha("0"),), email=A),                                       # d1 trực tiếp
+        lc("2", (sha("1"),), email=A),                                       # f1
+        lc("3", (sha("2"),), email=B),                                       # f2
+        lc("4", (sha("3"),), email=A),                                       # f3
+        lc("5", (sha("1"),), email=A),                                       # d2 trực tiếp
+        lc("6", (sha("5"), sha("4")), "Merge pull request #7 from o/f", "Tính năng X",
+           email=C, when="2026-01-10T01:00:00+00:00"),                      # M
+        lc("7", (sha("6"),), "Sửa lỗi (#12)", email=A),                      # squash
+    ]
+    stats = (
+        CommitLineStats(sha("1"), A, 5, 0, 4, 0),
+        CommitLineStats(sha("2"), A, 3, 1, 2, 1),
+        CommitLineStats(sha("3"), B, 4, 0, 4, 0),
+        CommitLineStats(sha("4"), A, 1, 0, 1, 0),
+        CommitLineStats(sha("6"), C, 1, 0, 1, 0),
+        CommitLineStats(sha("7"), A, 2, 1, 2, 1),
+    )
+    accounts = {sha(ch): e for ch, e in zip("1234567", (A, A, B, A, A, C, A), strict=True)}
+    attr = PeriodAttribution(sha("s"), sha("e"), (), (), accounts, (), stats)
+
+    rows = pr_metrics(attr, commits, [A, B, C], TZ)
+    merged = datetime.fromisoformat("2026-01-10T08:00:00+07:00")
+    assert rows == [
+        PrRow(7, "Tính năng X", sha("6"), merged, A, 2, 3, 1),
+        PrRow(7, "Tính năng X", sha("6"), merged, B, 1, 4, 0),
+        PrRow(7, "Tính năng X", sha("6"), merged, C, 0, 1, 0),
+        PrRow(12, "Sửa lỗi", sha("7"), commits[-1].author_date, A, 1, 2, 1),
+        PrRow(None, "", "", None, A, 2, 4, 0),
+    ]
+    assert rows[0].merged_at.utcoffset() == timedelta(hours=7)
+    assert [r.net_code for r in rows] == [2, 4, 1, 1, 4]
+    assert NO_PR_LABEL == "(Không thuộc PR)"
+
+
+def test_pr_metrics_filter_zero_cells_unknown_sha() -> None:
+    """TC-counter-50: lọc account, giữ ô chỉ-có-commit, bỏ ô toàn 0, sha lạ → nhóm không PR."""
+    ghost = sha("9")
+    commits = [
+        lc("1", (sha("0"),), "Việc nhỏ (#3)", email=A),                      # squash: chỉ có commit
+        lc("2", (sha("0"),), email=B),                                       # bob trong PR 8
+        lc("3", (sha("0"), sha("2")), "Merge pull request #8 from o/g", "Tám", email=A),
+    ]
+    stats = (
+        CommitLineStats(sha("1"), A, 0, 0, 0, 0),
+        CommitLineStats(sha("2"), B, 6, 0, 6, 0),
+        CommitLineStats(sha("3"), A, 0, 0, 0, 0),       # merge của alice, toàn 0 → ô (8, A) bị bỏ
+        CommitLineStats(ghost, A, 4, 0, 4, 0),
+    )
+    accounts = {sha("1"): A, sha("2"): B, sha("3"): A, ghost: A}
+    attr = PeriodAttribution(sha("s"), sha("e"), (), (), accounts, (), stats)
+
+    rows = pr_metrics(attr, commits, [A], TZ)
+    assert [(r.pr, r.account, r.commits, r.added_code, r.deleted_code) for r in rows] == [
+        (3, A, 1, 0, 0), (None, A, 0, 4, 0)]
+    assert all(r.account != B for r in rows)
+
+
+def test_pr_metrics_without_any_pr() -> None:
+    """TC-counter-51: không có PR → mọi dòng là nhóm không thuộc PR, Σ khớp."""
+    commits = [lc("1", (sha("0"),), email=A), lc("2", (sha("1"),), email=B)]
+    stats = (CommitLineStats(sha("1"), A, 3, 0, 3, 0), CommitLineStats(sha("2"), B, 2, 1, 2, 1))
+    attr = PeriodAttribution(sha("s"), sha("e"), (), (), {sha("1"): A, sha("2"): B}, (), stats)
+    rows = pr_metrics(attr, commits, [A, B], TZ)
+    assert [(r.pr, r.account, r.commits, r.added_code, r.deleted_code) for r in rows] == [
+        (None, A, 1, 3, 0), (None, B, 1, 2, 1)]
+
+
+def test_pr_metrics_real_git(make_repo, cache_root: Path) -> None:
+    """TC-counter-52: repo git thật — merge PR, squash, trực tiếp; Σ theo PR = user_metrics."""
+    src = make_repo()
+    base = src.commit("base", "2025-12-20T10:00:00+07:00", files={"app.py": "x0 = 0\n"})
+    src.git("checkout", "-q", "-b", "feat", base)
+    src.commit("bob b", "2026-01-03T10:00:00+07:00", author=BOB,
+               files={"b.py": j(["b1 = 1", "b2 = 2", "b3 = 3", "b4 = 4"])})
+    src.commit("alice c", "2026-01-04T10:00:00+07:00", author=ALICE,
+               files={"c.py": j(["c1 = 1", "c2 = 2"])})
+    src.checkout("main")
+    src.commit("alice main", "2026-01-05T10:00:00+07:00", author=ALICE,
+               files={"app.py": j(["x0 = 0", "a1 = 1", "a2 = 2", "a3 = 3"])})
+    merge = src.merge("feat", "Merge pull request #7 from o/feat\n\nThêm b.py",
+                      "2026-01-06T10:00:00+07:00", author=CAROL)
+    squash = src.commit("Sửa lỗi (#9)", "2026-01-07T10:00:00+07:00", author=ALICE,
+                        files={"d.py": "d1 = 1\n"})
+    src.commit("bob direct", "2026-01-08T10:00:00+07:00", author=BOB, files={"e.py": "e1 = 1\n"})
+
+    ctx = prepare(src, cache_root)
+    attr = ctx.attribute()
+    rows = pr_metrics(attr, ctx.commits, [A, B, C], TZ)
+    assert [(r.pr, r.account, r.commits, r.added_code, r.deleted_code) for r in rows] == [
+        (7, A, 1, 2, 0), (7, B, 1, 4, 0), (9, A, 1, 1, 0), (None, A, 1, 3, 0), (None, B, 1, 1, 0)]
+    pr7 = rows[0]
+    assert (pr7.title, pr7.merge_sha) == ("Thêm b.py", merge)
+    assert pr7.merged_at == datetime.fromisoformat("2026-01-06T10:00:00+07:00")
+    assert rows[2].merge_sha == squash and rows[2].title == "Sửa lỗi"
+
+    summaries = summarize_users(ctx.commits, AccountResolver()).users
+    for m in user_metrics(attr, summaries, [A, B, C]):
+        mine = [r for r in rows if r.account == m.account]
+        assert sum(r.commits for r in mine) == m.commits
+        assert sum(r.added_code for r in mine) == m.added_code
+        assert sum(r.deleted_code for r in mine) == m.deleted_code
+
+
+def test_pr_metrics_deterministic_and_fast() -> None:
+    """TC-counter-53: tái lập; đồ thị 3000 commit + 300 merge PR chạy dưới 5 giây."""
+    import time
+
+    when = datetime.fromisoformat("2026-01-06T10:00:00+07:00")
+    commits: list[LogCommit] = []
+    prev = sha("d")
+    main: list[str] = []
+    for k in range(3000):
+        s = f"{k:040x}"
+        commits.append(LogCommit(s, (prev,), "a", A, "a", A, when))
+        main.append(s)
+        prev = s
+    for i in range(300):
+        f, m = f"f{i:039x}", f"e{i:039x}"
+        commits.append(LogCommit(f, (main[10 * i],), "b", B, "b", B, when))
+        commits.append(LogCommit(m, (main[10 * i + 5], f), "c", C, "c", C, when,
+                                 f"Merge pull request #{i + 1} from o/b{i}", f"PR {i + 1}"))
+    main_set = set(main)
+    stats = tuple(CommitLineStats(c.sha, A if c.sha in main_set else B, 1, 0, 1, 0)
+                  for c in commits if not c.is_merge)
+    accounts = {c.sha: (A if c.sha in main_set else B if c.sha[0] == "f" else C) for c in commits}
+    attr = PeriodAttribution(sha("s"), sha("e"), (), (), accounts, (), stats)
+
+    started = time.perf_counter()
+    first = pr_metrics(attr, commits, [A, B, C], TZ)
+    assert time.perf_counter() - started < 5
+    assert first == pr_metrics(attr, commits, [A, B, C], TZ)
+    assert sum(1 for r in first if r.pr is not None and r.account == B) == 300

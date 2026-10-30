@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,7 +92,7 @@ def test_all_users_table(repo14: str, env: SimpleNamespace) -> None:
     assert lines[3].startswith("Snapshot end:   ") and "2026-01-08 10:00 bob del" in lines[3]
     assert lines[4] == "User: Tất cả user"
     table = rows(r.stdout)
-    assert ["10", "20", "+10", "4"] in table
+    assert ["10", "20", "+10", "13", "3", "4"] in table
     assert ["Python", "10", "20", "+10"] in table
     assert ["alice", "2", "5", "2", "+3", "1"] in table
     assert ["bob", "2", "8", "1", "+7", "2"] in table
@@ -107,7 +108,7 @@ def test_only_alice(repo14: str, env: SimpleNamespace) -> None:
     r = invoke(*base(repo14, env, "--user", "alice"))
     assert r.exit_code == 0, r.output
     table = rows(r.stdout)
-    assert ["10", "13", "+3", "2"] in table
+    assert ["10", "13", "+3", "5", "2", "2"] in table
     assert "User: alice" in r.stdout.splitlines()
     assert not [row for row in table if row and row[0] == "bob"]
     assert ["alice", "2", "5", "2", "+3", "1"] in table
@@ -119,7 +120,7 @@ def test_only_bob(repo14: str, env: SimpleNamespace) -> None:
     """TC-cli-analyze-03: --user bob — 10/17, thư mục …_bob."""
     r = invoke(*base(repo14, env, "--user", "bob"))
     assert r.exit_code == 0, r.output
-    assert ["10", "17", "+7", "2"] in rows(r.stdout)
+    assert ["10", "17", "+7", "8", "1", "2"] in rows(r.stdout)
     assert (env.out / "repo_main_2026-01-01_2026-01-31_bob").is_dir()
 
 
@@ -127,7 +128,7 @@ def test_alice_and_bob(repo14: str, env: SimpleNamespace) -> None:
     """TC-cli-analyze-04: alice + bob, có / không --separate-users."""
     r = invoke(*base(repo14, env, "--user", "bob", "--user", "alice"))
     assert r.exit_code == 0, r.output
-    assert ["10", "20", "+10", "4"] in rows(r.stdout)
+    assert ["10", "20", "+10", "13", "3", "4"] in rows(r.stdout)
     assert "User: alice, bob" in r.stdout.splitlines()
     assert (env.out / "repo_main_2026-01-01_2026-01-31_multi-2users").is_dir()
     assert len(export_lines(r.stdout)) == 2
@@ -154,7 +155,7 @@ def test_output_files_and_run_log(repo14: str, env: SimpleNamespace) -> None:
     assert len(starts) == 1 and len(starts[0]) == len("start_2026-01-01_") + 7 + len(".zip")
     assert sorted(set(names) - set(starts)) == sorted([
         "end_2026-01-31_all.zip", "loc_report.xlsx", "loc_by_user.csv", "loc_by_language.csv",
-        "loc_by_file.csv", "warnings.csv", "manifest.json"])
+        "loc_by_file.csv", "loc_by_pr.csv", "warnings.csv", "manifest.json"])
     log = (env.out / "run.log").read_text(encoding="utf-8")
     assert any(" INFO " in line and "C_START=" in line for line in log.splitlines())
     assert not [p for p in env.out.iterdir() if p.name.startswith((".loc-tmp-", ".loc-old-"))]
@@ -170,7 +171,7 @@ def test_json(repo14: str, env: SimpleNamespace) -> None:
     assert data["out_dir"] == result_dir.as_posix()
     assert data["manifest"] == manifest_of(result_dir)
     assert data["files"] == sorted(p.name for p in result_dir.iterdir())
-    assert len(data["files"]) == 8
+    assert len(data["files"]) == 9
     assert [u["account"] for u in data["users"]] == ["alice", "bob"]
     assert data["users"][0]["net_code"] == 3 and data["users"][1]["files_changed"] == 2
     assert data["languages"][0]["delta"] == 10
@@ -311,7 +312,7 @@ def test_empty_start(repo14: str, env: SimpleNamespace) -> None:
     assert r.exit_code == 0, r.output
     assert "Snapshot start: (không có commit trước start)" in r.stdout.splitlines()
     table = rows(r.stdout)
-    assert ["0", "20", "+20", "5"] in table
+    assert ["0", "20", "+20", "20", "0", "5"] in table
     assert ["start_2025-01-01_empty.zip", "0", "file", "LOC", "0"] in table
     assert [row for row in table if row and row[0] == "admin@example.com"]
 
@@ -326,7 +327,7 @@ def test_no_commit_in_period(repo14: str, env: SimpleNamespace) -> None:
     lines = r.stdout.splitlines()
     assert "Không có user nào có commit trong kỳ." in lines
     assert not [row for row in rows(r.stdout) if row and row[0] == "Tổng"]
-    assert ["20", "20", "0", "0"] in rows(r.stdout)
+    assert ["20", "20", "0", "0", "0", "0"] in rows(r.stdout)
     assert any(line.startswith("Kiểm tra chéo:") and line.endswith("→ đạt") for line in lines)
 
 
@@ -502,7 +503,7 @@ def test_number_format(repo14: str, env: SimpleNamespace,
     assert r.exit_code == 0, r.output
     lines = r.stdout.splitlines()
     table = rows(r.stdout)
-    assert ["10", "1,020", "+1,010", "4"] in table
+    assert ["10", "1,020", "+1,010", "1,013", "3", "4"] in table
     assert ["Python", "10", "1,020", "+1,010"] in table
     assert ["alice", "2", "1,005", "2", "+1,003", "1"] in table
     assert ["Tổng", "4", "1,013", "3", "+1,010", "2"] in table
@@ -542,3 +543,42 @@ def test_attribution_option(repo14: str, env: SimpleNamespace,
     assert manifest_of(env.tmp / "out2" / ALL_DIR)["options"]["attribution_mode"] == "last_commit"
     bad = invoke(*base(repo14, env, "--attribution", "x", out=env.tmp / "out3"))
     assert bad.exit_code == 2 and not (env.tmp / "out3").exists()
+
+
+def test_loc_end_option(repo14: str, env: SimpleNamespace,
+                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-cli-analyze-27: --loc-end net | added; cột Code thêm / Code xóa ở bảng tổng."""
+    modes: list[str] = []
+    orig_run = pipeline.run_analysis
+
+    def spy_run(*a: Any, **k: Any) -> Any:
+        modes.append(a[1].loc_end_mode)
+        return orig_run(*a, **k)
+
+    monkeypatch.setattr(pipeline, "run_analysis", spy_run)
+    plain = invoke(*base(repo14, env))
+    assert plain.exit_code == 0, plain.output
+    lines = plain.stdout.splitlines()
+    header = next(i for i, line in enumerate(lines) if line.startswith("LOC start"))
+    assert re.split(r"\s{2,}", lines[header].strip()) == [
+        "LOC start", "LOC end", "Chênh lệch", "Code thêm", "Code xóa", "Commit"]
+    assert lines[header + 1].split() == ["10", "20", "+10", "13", "3", "4"]
+    assert "Cách tính LOC end:" not in plain.output
+
+    added = invoke(*base(repo14, env, "--loc-end", "added", out=env.tmp / "out2"))
+    assert added.exit_code == 0, added.output
+    lines = added.stdout.splitlines()
+    note = ("Cách tính LOC end: Theo code thêm (LOC start + tổng code thêm) — "
+            "LOC end đếm trên export: 20")
+    header = next(i for i, line in enumerate(lines) if line.startswith("LOC start"))
+    assert lines[header - 1] == note
+    assert lines[header + 1].split() == ["10", "23", "+13", "13", "3", "4"]
+    assert ("Kiểm tra chéo: 10 + (+10) = 20; LOC end 20; lệch 0.000 % (ngưỡng 0.5 %) → đạt"
+            in lines)
+    assert modes == ["net_code", "added_code"]
+    js = invoke(*base(repo14, env, "--loc-end", "added", "--json", out=env.tmp / "out3"))
+    assert js.exit_code == 0, js.output
+    totals = json.loads(js.stdout)["manifest"]["totals"]
+    assert (totals["loc_end"], totals["reported_loc_end"]) == (20, 23)
+    bad = invoke(*base(repo14, env, "--loc-end", "x", out=env.tmp / "out4"))
+    assert bad.exit_code == 2 and not (env.tmp / "out4").exists()

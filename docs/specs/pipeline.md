@@ -2,12 +2,12 @@
 id: pipeline
 title: Pipeline phân tích (export start/end, gán tác giả, đếm LOC, báo cáo)
 type: module
-milestone: M5
+milestone: M5, M8
 modules: [src/loc_counter/pipeline.py]
 tests: [tests/test_pipeline.py]
 spec_refs: ["3.1", "3.2", "3.3", "3.4", "3.5", "8.1", "8.2", "8.3", "10.2", "12", "15", "16"]
 depends_on: [config, git_repo, snapshot, identity, attribution, builder, counter, report, classifier]
-status: implemented
+status: reviewed
 ---
 
 # Pipeline phân tích
@@ -76,6 +76,7 @@ class AnalysisRequest:
     exclude_bots: bool = False
     separate_users: bool = False
     attribution_mode: AttributionMode = "line"   # "last_commit": gán theo commit cuối của file (attribution 5.10)
+    loc_end_mode: LocEndMode = "net_code"        # "added_code": LOC end = LOC start + Σ code thêm (report A15, A24)
 
 @dataclass(frozen=True)
 class PeriodContext:
@@ -142,13 +143,14 @@ with run_log(out_root, secrets=(token,)):         # CLI bọc cả GitRepo.open 
 | `request.exclude_bots` | bool | False | | §16 |
 | `request.separate_users` | bool | False | | §3.3 |
 | `request.attribution_mode` | `"line"` \| `"last_commit"` | `"line"` | khác → `ValueError` | yêu cầu 2026-10-30 |
+| `request.loc_end_mode` | `"net_code"` \| `"added_code"` | `"net_code"` | khác → `ValueError` (kiểm ở đầu `run_analysis`, cùng chỗ `attribution_mode`) | yêu cầu 2026-10-30, A24 |
 | `request.period.timezone` | str | `Asia/Bangkok` (từ `make_period`) | thắng `config.timezone` (A10) | §3.1 |
 | `request.out_root` | Path | — (CLI bắt buộc `--out`) | chưa có → tạo; là file → lỗi | §11, §12 |
 | `progress` | callback \| None | None | gọi lúc **bắt đầu** mỗi bước | §10.2 |
 | `now` | callable \| None | `datetime.now(ZoneInfo(tz)).replace(microsecond=0)` | aware | D40-N14 |
 | `login_cache` | Path \| None | None → `identity.DEFAULT_LOGIN_CACHE` (đọc lúc gọi) | | D18 |
 
-Đầu ra trong `<out_root>/<result_dir_name>/`: `start_<date>_<sha7|empty>.zip`, `end_<date>_<tag>.zip` (+ zip riêng), `loc_report.xlsx`, `loc_by_user.csv`, `loc_by_language.csv`, `loc_by_file.csv`, `warnings.csv`, `manifest.json`. `run.log` ở `<out_root>/run.log` (ngoài thư mục kết quả).
+Đầu ra trong `<out_root>/<result_dir_name>/`: `start_<date>_<sha7|empty>.zip`, `end_<date>_<tag>.zip` (+ zip riêng), `loc_report.xlsx`, `loc_by_user.csv`, `loc_by_language.csv`, `loc_by_file.csv`, `loc_by_pr.csv` (M8), `warnings.csv`, `manifest.json`. `run.log` ở `<out_root>/run.log` (ngoài thư mục kết quả).
 
 ## 5. Luồng xử lý
 
@@ -217,16 +219,16 @@ Ký hiệu: `cfg = request.config`, `filters = cfg.filters`, `tz = request.perio
 16. Export chính `main_export`, `main_count`:
     - `languages = compare_languages(start_count, main_count)`;
     - `files = compare_files(start_count, main_count, rename_map(attr, [f.path for f in main_export.files]))`;
-    - `user_rows = user_metrics(attr, summaries, counted)`; `weeks = weekly_metrics(attr, commits, counted, tz)`;
+    - `user_rows = user_metrics(attr, summaries, counted)`; `weeks = weekly_metrics(attr, commits, counted, tz)`; `pr_rows = pr_metrics(attr, commits, counted, tz)` (M8, D43);
     - `check = cross_check(start_count.total_code, main_count.total_code, [r.net_code for r in user_rows])`.
 17. Mỗi job riêng (`jobs[1:]`, một account `a`): `check_i = cross_check(loc_start, loc_i, [row(a).net_code])` với `row(a)` lấy từ `user_rows` (A11).
 18. Cảnh báo phạm vi `kiểm tra chéo`: `cross_check_warning(check, main.tag)` rồi `cross_check_warning(check_i, job.tag)` theo thứ tự job (bỏ `None`). Phạm vi `định danh`: mỗi chuỗi trong `getattr(resolver.github, "warnings", ())` (đọc **sau** bước 2) → `LocWarning(IDENTITY, "", msg)`.
-19. Log INFO mỗi export theo thứ tự start → end theo `jobs`: `<file>: <n> file, LOC <loc>`; kiểm tra chéo của export chính rồi từng zip riêng (theo `jobs`): `<tag>: loc_start + Σ net = expected, loc_end, lệch %`.
+19. Log INFO mỗi export theo thứ tự start → end theo `jobs`: `<file>: <n> file, LOC <loc>`; kiểm tra chéo của export chính rồi từng zip riêng (theo `jobs`): `<tag>: loc_start + Σ net = expected, loc_end, lệch %`. Mode `added_code` (A24): thêm một dòng INFO `LOC end theo code thêm: loc_start + Σ added_code = <n> (đếm trên export: <loc_end>)`.
 
 **Bước 5 — Tạo báo cáo**
 20. `step(REPORT)`. `warnings = _merge_warnings(...)` (5.10).
 21. `exports = (ExportSummary("start", start_name, None, None, len(start_plan.files), loc_start), ExportSummary("end", end_names[0], main.tag, main.accounts, len(main_export.files), loc_end, check), *[ExportSummary("separate", …, check_i)])`.
-22. `data = ReportData(repo=repo.source, branch=snaps.branch, period=period, c_start=snaps.c_start, c_end=snaps.c_end, users=counted, all_users=selected is None, config=dataclasses.replace(cfg, timezone=tz), options=ReportOptions(selected, request.exclude_bots, request.separate_users, request.attribution_mode), loc_start=…, loc_end=…, languages=tuple(languages), user_rows=tuple(user_rows), files=tuple(files), weeks=tuple(weeks), cross_check=check, warnings=warnings, exports=exports)`.
+22. `data = ReportData(repo=repo.source, branch=snaps.branch, period=period, c_start=snaps.c_start, c_end=snaps.c_end, users=counted, all_users=selected is None, config=dataclasses.replace(cfg, timezone=tz), options=ReportOptions(selected, request.exclude_bots, request.separate_users, request.attribution_mode, request.loc_end_mode), loc_start=…, loc_end=…, languages=tuple(languages), user_rows=tuple(user_rows), files=tuple(files), weeks=tuple(weeks), pr_rows=tuple(pr_rows), cross_check=check, warnings=warnings, exports=exports)`.
 23. `generated_at = (now or default)()`; `report_files = write_reports(tmp, data, generated_at)`.
 24. `_commit_dir(tmp, final)` (5.9). Log INFO `Kết quả: <final>`.
 25. Trả `AnalysisResult(final, data, snaps, tuple(summaries), final / start_name, tuple(final / n for n in end_names), tuple(final / p.name for p in report_files), generated_at)`.
@@ -331,7 +333,7 @@ Fixture: `section14_repo` (thêm tham số tên repo nguồn để thư mục l�
 | TC-pipeline-28 | `result_dir_name` | nguồn `https://github.com/org/repo.git`, `git@github.com:org/Repo.GIT`, `file:///D:/x/r`, `D:\x\r\`, `/home/u/r/.git`; nhánh `feature/x`; repo / nhánh 50 ký tự; start 08:30, end 23:59 (≡ không giờ), end 17:30 | `repo`, `Repo`, `r`, `r`, `r`; `feature_x`; phần dài cắt đúng 40 ký tự `…-<6 hex>` = sha1 chuỗi gốc; `2026-01-01T0830_2026-01-31`; `…_2026-01-31T1730_…` | unit |
 | TC-pipeline-29 | Resolver dùng chung | spy `summarize_users`, `attribute_period`; `FakeSession` đếm request | cùng một instance resolver; mỗi email tra API đúng một lần | integration |
 | TC-pipeline-30 | `prepare_period` + `context` | gọi `prepare_period` rồi `run_analysis(context=ctx)`; biến thể `context` khác nhánh | không gọi lại `find_snapshots`/`log_commits` (spy); kết quả như TC-01; khác nhánh → `ValueError` | integration |
-| TC-pipeline-31 | `AnalysisResult` | TC-05 | mọi đường dẫn tồn tại trong `out_dir`; `end_zips` cùng thứ tự `data.exports[1:]`; `report_files` đúng 6 tên; `period_users` đủ account; manifest khớp `data` (`totals`, `exports`) | integration |
+| TC-pipeline-31 | `AnalysisResult` | TC-05 | mọi đường dẫn tồn tại trong `out_dir`; `end_zips` cùng thứ tự `data.exports[1:]`; `report_files` đúng 7 tên (có `loc_by_pr.csv`); `period_users` đủ account; manifest khớp `data` (`totals`, `exports`) | integration |
 | TC-pipeline-32 | Múi giờ trong config (A10) | `period` UTC, `config.timezone = Asia/Bangkok` | manifest `config.timezone == "UTC" == timezone`; timestamp entry zip theo UTC | integration |
 | TC-pipeline-33 | Độ dài đường dẫn (A9) | monkeypatch hàm kiểm giới hạn → chưa bật; `out_root` dài ~230 ký tự; biến thể long path đã bật; đọc registry bằng `winreg` giả (`LongPathsEnabled` = 1, = 0, lỗi đọc) và `os.name` khác `nt` | `PipelineError` "Đường dẫn kết quả quá dài" trước `attribute_period` (spy), không tạo `.loc-tmp-*`; biến thể bật → không kiểm; registry: 1 → bật, 0 / lỗi → chưa bật; không phải `nt` → không áp giới hạn | unit |
 | TC-pipeline-34 | Timestamp zip | TC-01 | entry zip start mang committer date C_START, zip end mang C_END theo `Asia/Bangkok` | integration |
@@ -340,6 +342,8 @@ Fixture: `section14_repo` (thêm tham số tên repo nguồn để thư mục l�
 | TC-pipeline-38 | Dùng lại kết quả gán tác giả (A21) | repo §14; `ctx = prepare_period(...)`; spy `pipeline.attribute_period`; chạy `run_analysis(context=ctx)` lần lượt: (1) mọi user; (2) chọn `alice` (cùng filters, cùng resolver); (3) `count_docstrings` khác; (4) resolver mới (cùng filters như 3); mỗi lần `out_root` riêng | spy gọi ở (1), (3), (4) — **không** gọi ở (2); `run.log` của (2) có `Dùng lại kết quả gán tác giả đã tính cho kỳ này`, của (1), (3), (4) thì không; lần (2) bằng một lần chạy (2) với ctx mới: `ReportData` bằng nhau, mọi file kết quả trùng SHA-256 (kể cả manifest, cùng `now`); `len(ctx.attribution_memo) == 1`; `PeriodContext` 5 tham số vị trí vẫn dựng được, hai ctx khác memo vẫn bằng nhau; `dataclasses.replace(ctx)` có memo rỗng; memo không giữ tham chiếu mạnh tới resolver (resolver bị thu hồi → weakref chết → tính lại) | integration |
 | TC-pipeline-39 | Log của luồng con vào `run.log` (A22) | trong `with run_log(...)`: (a) phát WARNING từ `ThreadPoolExecutor` với `contextvars.copy_context().run`; (b) phát WARNING từ `threading.Thread` thường; (c) chạy `attribute_period` trên repo TC-attribution-11 với `MAX_MERGE_DEPTH = 0`, `ATTRIBUTION_WORKERS = 4`; (d) hai phiên `run_log` lồng ở hai luồng khác nhau, mỗi phiên một luồng con có context | (a) có trong `run.log`; (b) không có; (c) `run.log` có `Vượt giới hạn đệ quy merge`; (d) mỗi `run.log` chỉ có log của phiên mình; sau `with`, `_RUN_LOG_ID` trở về như trước (ở luồng chính và trong từng luồng phiên); (e) `__enter__` trong một context, `__exit__` ở context khác → không ném lỗi, handler đã gỡ, level logger khôi phục, `run.log` xóa được | unit + integration |
 | TC-pipeline-40 | Chế độ gán `last_commit` (A23) | repo §14 + identities: (a) `AnalysisRequest(attribution_mode="last_commit")`, tất cả user → 10/20, cross_check 0, `manifest.options.attribution_mode == "last_commit"`; (b) `--user alice` → 10/10, `--user bob` → 10/20; (c) spy `attribute_period` nhận `mode`; hai lần chạy cùng `ctx` khác mode → gọi lại (memo khóa theo mode); (d) `mode` lạ → `ValueError` | integration |
+| TC-pipeline-41 | Cách tính LOC end (A24) | repo §14 + identities, tất cả user: (a) mặc định; (b) `AnalysisRequest(loc_end_mode="added_code")`; (c) giá trị lạ | (a) `data.options.loc_end_mode == "net_code"`, `reported_loc_end == 20`; (b) `data.loc_end == 20` (đếm trên export), `reported_loc_end == 23` (10 + 13), cross_check như (a) (`ok`, lệch 0); manifest `totals.loc_end == 20`, `reported_loc_end == 23`, `options.loc_end_mode == "added_code"`; zip, `Theo_ngon_ngu` / `Theo_file` / CSV trùng SHA-256 với (a); `run.log` có `LOC end theo code thêm`; spy `attribute_period` không bị gọi lại khi chỉ đổi mode này trên cùng `ctx`; (c) `ValueError`, chưa tạo thư mục kết quả | integration |
+| TC-pipeline-42 | LOC theo PR (M8, D43) | repo: base trước kỳ; nhánh `feat` (bob thêm `b.py` 4 dòng, alice thêm `c.py` 2 dòng); main: alice thêm 3 dòng `app.py`; merge `Merge pull request #7 from o/feat` (body `Thêm b.py`, author carol); alice `Sửa lỗi (#9)` thêm 1 dòng; tất cả user | `data.pr_rows` = (7, alice, 1, 2, 0), (7, bob, 1, 4, 0), (9, alice, 1, 1, 0), (None, alice, 1, 3, 0); `report_files` có `loc_by_pr.csv`; sheet `Theo_PR` 5 hàng (tiêu đề + 4), hàng PR 7 có tiêu đề `Thêm b.py` và ngày `2026-01-06`; Σ theo PR của từng account = `user_rows` (commit, thêm, xóa); chạy 2 lần → `loc_by_pr.csv` trùng SHA-256 | integration |
 | TC-pipeline-35 | `make_resolver` | nguồn GitHub + token; GitHub không token; nguồn local + token | `github` là `GitHubLoginResolver` (cache = `login_cache`); `None`; `None` | unit |
 
 Phủ mandatory-tests: mục D (kiểm tra chéo §8.3) — TC-01..04, 19; mục E — TC-07, 08, 24, 25, 28 (+ tên thư mục / user-tag TC-01..05).
@@ -371,6 +375,7 @@ Phủ mandatory-tests: mục D (kiểm tra chéo §8.3) — TC-01..04, 19; mục
 | A21 | Memo gán tác giả gắn vào `PeriodContext` (vòng đời theo memo kỳ của UI; mỗi memo gắn với đúng một ctx — `init=False` nên `replace` không chia sẻ memo), khóa `FilterConfig` (gồm `count_docstrings` → classifier) + đồng nhất resolver qua **weakref** (`ref() is resolver`: không trùng `id()` sau thu hồi, ctx không giữ token); giữ 1 phần tử | Khuyến nghị (đề xuất tăng tốc 2026-10-28 mục 2) | Chốt 2026-10-29 (**) |
 | A22 | Lọc `run.log` theo luồng **hoặc** `ContextVar` của phiên, để log của luồng gán tác giả song song (attribution R20) không bị mất | Khuyến nghị | Chốt 2026-10-29 (**) |
 | A23 | `attribution_mode` đi qua `AnalysisRequest` → `attribute_period(mode=…)` và `ReportOptions.attribution_mode` (manifest). Memo A21 khóa theo `(filters, mode)`: đổi chế độ thì tính lại. TC-pipeline-40 | Khuyến nghị (ủy quyền 2026-10-30) |
+| A24 | `loc_end_mode` (report A15) đi qua `AnalysisRequest` → `ReportOptions.loc_end_mode`; pipeline **không** đổi `loc_end` / `check` / `exports` (vẫn đếm trên export) — `ReportData` tự suy ra `reported_loc_end`. Không ảnh hưởng gán tác giả nên memo A21 không khóa theo mode này. TC-pipeline-41 | Khuyến nghị (ủy quyền 2026-10-23) |
 
 (**) Người dùng chọn "Làm 1,2" (2026-10-29); duyệt theo ủy quyền làm theo khuyến nghị.
 
@@ -390,3 +395,8 @@ Phủ mandatory-tests: mục D (kiểm tra chéo §8.3) — TC-01..04, 19; mục
 | 2026-10-24 | Tạo mới theo PLAN M5 (phạm vi `pipeline`, D11, D13, D21, D31, D35–D40) + phân tích `spec-analyst` (N1–N19, API thực tế các module; thử nghiệm `os.replace`/`rmtree` trên Windows, `LongPathsEnabled`). A1–A17 chốt theo khuyến nghị, người dùng ủy quyền → `approved` | M5 (`/feature-spec pipeline`) |
 | 2026-10-30 | `AnalysisRequest.attribution_mode`, truyền vào `attribute_period` và `ReportOptions`, memo khóa theo `(filters, mode)` (A23, TC-40) | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
 | 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | `AnalysisRequest.loc_end_mode` (`net_code` mặc định / `added_code`), kiểm hợp lệ, truyền vào `ReportOptions`, log INFO ở mode `added_code` (A24, TC-41) | Người dùng yêu cầu "LOC end cho chọn cách tính theo added code hoặc net code". Chốt theo khuyến nghị, người dùng ủy quyền → `approved` |
+| 2026-10-30 | Test pass (tổng code thêm / xóa + cách tính LOC end: TC-report-26, pipeline-41, cli-analyze-27, screen-input-26, screen-result-15; toàn bộ 784 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | Theo review `reviews/loc-end-mode-20261030.md` (PASS_WITH_NOTES): TC-41 theo manifest mới (`totals.loc_end` = LOC đếm trên export, `reported_loc_end`) | /feature-review |
+| 2026-10-30 | M8 (D43): bước 16 thêm `pr_rows = pr_metrics(attr, commits, counted, tz)`, bước 22 truyền `pr_rows` vào `ReportData`; danh sách file đầu ra (mục 1/5) thêm `loc_by_pr.csv` (7 tên trong `report_files`, kiểm độ dài đường dẫn); TC-31 cập nhật, TC-42. Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | PLAN M8, D43 |
+| 2026-10-30 | Test pass sau sửa theo review (toàn bộ 784 test, ruff sạch, coverage 99 %). Review PASS_WITH_NOTES (`reviews/loc-end-mode-20261030.md`), Minor 1 + Nit đã sửa → `reviewed` | /feature-review |

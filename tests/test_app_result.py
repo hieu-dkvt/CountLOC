@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from datetime import date, time
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +14,14 @@ from test_app_input import IDS_YAML, analyze, load, pick_key, select_mode, set_p
 
 from loc_counter import app
 from loc_counter.config import AppConfig
+from loc_counter.counter import NO_PR_LABEL, PrRow
 from loc_counter.git_repo import GitRepo
 from loc_counter.identity import AccountResolver, IdentityMap, IdentityRule
 from loc_counter.pipeline import AnalysisRequest, AnalysisResult, run_analysis, run_log
 from loc_counter.snapshot import make_period
 
 JAN = (date(2026, 1, 1), date(2026, 1, 31))
+BKK = timezone(timedelta(hours=7))
 IDS = IdentityMap((IdentityRule("alice", email="alice@example.com"),
                    IdentityRule("bob", email="bob@example.com")))
 
@@ -59,12 +61,13 @@ def downloads(at: Any) -> dict[str, Any]:
 
 # ---------- TC-01 .. TC-07 ----------
 def test_metrics(make_app, s14: Any, with_ids: Path) -> None:
-    """TC-screen-result-01: bốn số chính LOC start, LOC end, Chênh lệch, Commit."""
+    """TC-screen-result-01: số chính LOC start, LOC end, Chênh lệch, Code thêm, Code xóa, Commit."""
     at = analyze(load(make_app(), s14.path))
     assert not at.exception and not at.error
     assert "KẾT QUẢ" in values(at.subheader)
     assert [(m.label, m.value) for m in at.metric] == [
-        ("LOC start", "10"), ("LOC end", "20"), ("Chênh lệch", "+10"), ("Commit", "4")]
+        ("LOC start", "10"), ("LOC end", "20"), ("Chênh lệch", "+10"), ("Code thêm", "13"),
+        ("Code xóa", "3"), ("Commit", "4")]
 
 
 def test_language_frame(s14: Any, tmp_path: Path) -> None:
@@ -177,12 +180,12 @@ def test_download_all_files(make_app, s14: Any, tmp_path: Path, with_ids: Path,
     result = run(s14, tmp_path, ("alice", "bob"), separate=True)
     items = app.download_items(result)
     assert {i.path.name for i in items} == set(os.listdir(result.out_dir))
-    assert len(items) == 10
+    assert len(items) == 11
     for i in items:
         assert i.path.read_bytes() == (result.out_dir / i.path.name).read_bytes()
         assert i.mime == app.MIME[i.path.suffix] and i.key == f"dl_{i.path.name}"
     assert [i.path.name for i in items if i.group == "csv"] == [
-        "loc_by_user.csv", "loc_by_language.csv", "loc_by_file.csv"]
+        "loc_by_user.csv", "loc_by_language.csv", "loc_by_file.csv", "loc_by_pr.csv"]
 
     at = load(make_app(), s14.path)
     select_mode(at, "Chọn user")
@@ -290,3 +293,64 @@ def test_locked_downloads(make_app, s14: Any, with_ids: Path,
     assert at.text_input(key="file_query").disabled
     assert at.checkbox(key="file_changed_only").disabled
     assert at.multiselect(key="file_languages").disabled
+
+
+# ---------- TC-15: code thêm / xóa, cách tính LOC end ----------
+NOTE_ADDED = "LOC end = LOC start + tổng code thêm; LOC end đếm trên export: 20"
+
+
+def test_loc_end_mode(make_app, s14: Any, tmp_path: Path, with_ids: Path) -> None:
+    """TC-screen-result-15: metric Code thêm / Code xóa; LOC end theo code thêm + ghi chú."""
+    data = run(s14, tmp_path).data
+    assert app.loc_end_note(data) is None
+    added = dataclasses.replace(data, options=dataclasses.replace(data.options,
+                                                                  loc_end_mode="added_code"))
+    assert app.loc_end_note(added) == NOTE_ADDED
+
+    at = analyze(load(make_app(), s14.path))
+    assert NOTE_ADDED not in values(at.caption)
+    at.radio(key="loc_end_mode").set_value(app.LOC_END_MODES[1]).run()
+    analyze(at)
+    assert not at.exception and not at.error
+    assert [(m.label, m.value) for m in at.metric] == [
+        ("LOC start", "10"), ("LOC end", "23"), ("Chênh lệch", "+13"), ("Code thêm", "13"),
+        ("Code xóa", "3"), ("Commit", "4")]
+    assert NOTE_ADDED in values(at.caption)
+    assert any(t.startswith("Kiểm tra chéo: 10 + (+10) = 20; LOC end 20;") and t.endswith("→ đạt")
+               for t in values(at.success))
+
+
+def test_pr_section(make_app, s14: Any, tmp_path: Path, with_ids: Path) -> None:
+    """TC-screen-result-16: pr_frame, mục "Theo PR của từng user" và nút tải loc_by_pr.csv."""
+    data = run(s14, tmp_path).data
+    merged = datetime(2026, 1, 10, 8, 0, tzinfo=BKK)
+    pr_rows = (
+        PrRow(12, "Sửa lỗi", "b" * 40, datetime(2026, 1, 12, 9, 0, tzinfo=BKK), "alice", 1, 2, 1),
+        PrRow(None, "", "", None, "bob", 1, 1, 0),
+        PrRow(7, "Thêm X", "a" * 40, merged, "bob", 1, 4, 0),
+        PrRow(7, "Thêm X", "a" * 40, merged, "alice", 2, 3, 1),
+    )
+    frame = app.pr_frame(dataclasses.replace(data, pr_rows=pr_rows))
+    assert list(frame.columns) == ["PR", "Tiêu đề", "Merge commit", "Ngày merge", "User",
+                                   "Commit", "Code thêm", "Code xóa", "Code ròng"]
+    assert str(frame["PR"].dtype) == "Int64"
+    assert frame["PR"].tolist()[:3] == [7, 7, 12] and frame["PR"].isna().tolist()[3]
+    assert frame["User"].tolist() == ["alice", "bob", "alice", "bob"]
+    assert frame["Tiêu đề"].tolist() == ["Thêm X", "Thêm X", "Sửa lỗi", NO_PR_LABEL]
+    assert frame["Merge commit"].tolist() == ["aaaaaaa", "aaaaaaa", "bbbbbbb", ""]
+    assert frame["Ngày merge"].tolist() == ["2026-01-10", "2026-01-10", "2026-01-12", ""]
+    assert frame["Code ròng"].tolist() == [2, 4, 1, 1]
+    assert app.pr_frame(dataclasses.replace(data, pr_rows=())).empty
+
+    at = analyze(load(make_app(), s14.path))
+    assert not at.exception and not at.error
+    assert "**Theo PR của từng user**" in values(at.markdown)
+    tables = [d.value for d in at.dataframe if "Merge commit" in d.value.columns]
+    assert len(tables) == 1
+    assert tables[0]["User"].tolist() == ["alice", "bob"]
+    assert tables[0]["Code thêm"].sum() == 13
+    captions = values(at.caption)
+    assert app.PR_NOTE in captions
+    assert "Không tìm thấy PR nào trong lịch sử của kỳ." in captions
+    button = downloads(at)["dl_loc_by_pr.csv"]
+    assert not button.disabled

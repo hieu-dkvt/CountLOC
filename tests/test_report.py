@@ -1,4 +1,4 @@
-"""Test cho report.py (spec docs/specs/report.md, mục 9 — TC-report-01..25)."""
+"""Test cho report.py (spec docs/specs/report.md, mục 9 — TC-report-01..29)."""
 
 from __future__ import annotations
 
@@ -22,8 +22,10 @@ from openpyxl import Workbook, load_workbook
 from loc_counter import report
 from loc_counter.config import AppConfig, FilterConfig, config_to_dict
 from loc_counter.counter import (
+    NO_PR_LABEL,
     FileRow,
     LanguageRow,
+    PrRow,
     UserMetrics,
     WarningKind,
     WeekRow,
@@ -31,6 +33,7 @@ from loc_counter.counter import (
     compare_languages,
     count_export,
     cross_check,
+    pr_metrics,
     rename_map,
     total_metrics,
     user_metrics,
@@ -55,7 +58,8 @@ from loc_counter.snapshot import make_period, start_zip_name
 
 BKK = ZoneInfo("Asia/Bangkok")
 NOTE = "Bản export end theo user dùng để kiểm tra và đếm LOC, có thể không build/chạy được."
-SHEETS = ["Tong_quan", "Theo_ngon_ngu", "Theo_user", "Theo_file", "Theo_tuan", "Canh_bao"]
+SHEETS = ["Tong_quan", "Theo_ngon_ngu", "Theo_user", "Theo_file", "Theo_tuan", "Theo_PR",
+          "Canh_bao"]
 GEN = datetime(2026, 10, 22, 20, 52, 0, tzinfo=BKK)
 DIR_ERROR = "Thư mục kết quả không tồn tại hoặc không phải thư mục"
 
@@ -139,12 +143,13 @@ def sha256(path: Path) -> str:
 
 # ---------- TC-01 .. TC-11: xlsx ----------
 def test_names_and_sheets(tmp_path: Path) -> None:
-    """TC-report-01: tên file §12 và đúng 6 sheet theo thứ tự."""
+    """TC-report-01: tên file §12 (+ loc_by_pr.csv) và đúng 7 sheet theo thứ tự."""
     assert tuple(SHEETS) == report.SHEET_NAMES
     assert (report.XLSX_NAME, report.USER_CSV_NAME, report.LANGUAGE_CSV_NAME,
-            report.FILE_CSV_NAME, report.WARNINGS_CSV_NAME, report.MANIFEST_NAME) == (
+            report.FILE_CSV_NAME, report.PR_CSV_NAME, report.WARNINGS_CSV_NAME,
+            report.MANIFEST_NAME) == (
         "loc_report.xlsx", "loc_by_user.csv", "loc_by_language.csv", "loc_by_file.csv",
-        "warnings.csv", "manifest.json")
+        "loc_by_pr.csv", "warnings.csv", "manifest.json")
     assert report.end_scope("alice") == "end:alice"
     assert (report.SCOPE_START, report.SCOPE_ATTRIBUTION, report.SCOPE_CROSS_CHECK,
             report.SCOPE_IDENTITY) == ("start", "gán tác giả", "kiểm tra chéo", "định danh")
@@ -169,11 +174,14 @@ def test_overview_sheet(tmp_path: Path) -> None:
         ("Snapshot end", 'fffffff (2026-01-21 10:05) "Release 2.3"'),
         ("User", "alice, bob"),
         ("Cách gán tác giả", "Theo từng dòng"),
+        ("Cách tính LOC end", "Theo code ròng (đếm trên export)"),
         ("Số user được tính", 2),
         ("LOC start", 10),
         ("LOC end", 20),
         ("Chênh lệch", 10),
         ("Commit", 5),
+        ("Tổng code thêm", 13),
+        ("Tổng code xóa", 3),
         ("Tổng code ròng", 10),
         ("LOC end kỳ vọng", 20),
         ("Lệch kiểm tra chéo (%)", 0),
@@ -191,8 +199,8 @@ def test_overview_sheet(tmp_path: Path) -> None:
         ("end_2026-01-31_bob.zip", "End (riêng)", "bob", 2, 16, 17, 6.25, "Lệch quá ngưỡng"),
     ]
     assert got == expected_head
-    assert isinstance(ws["B14"].value, int)
-    assert ws["A1"].font.b and ws["A27"].font.b
+    assert isinstance(ws["B15"].value, int)
+    assert ws["A1"].font.b and ws["A30"].font.b
 
 
 def test_language_sheet(tmp_path: Path) -> None:
@@ -373,17 +381,19 @@ def test_xlsx_before_1980(tmp_path: Path) -> None:
 
 # ---------- TC-12 .. TC-14: CSV ----------
 def test_csv_format(tmp_path: Path) -> None:
-    """TC-report-12: 3 CSV — BOM, \\r\\n, tiêu đề tiếng Việt, số thô, không có dòng Tổng."""
+    """TC-report-12: 4 CSV — BOM, \\r\\n, tiêu đề tiếng Việt, số thô, không có dòng Tổng."""
     data = sample(files=(FileRow('a,"b".py', None, "Python", 1500, 1497),))
     paths = write_csv_reports(tmp_path, data)
     assert [p.name for p in paths] == ["loc_by_user.csv", "loc_by_language.csv",
-                                       "loc_by_file.csv"]
+                                       "loc_by_file.csv", "loc_by_pr.csv"]
     for p in paths:
         raw = p.read_bytes()
         assert raw.startswith(b"\xef\xbb\xbf")
         assert raw.endswith(b"\r\n")
         assert raw.count(b"\n") == raw.count(b"\r\n")
-    user, lang, file = (read_csv(p) for p in paths)
+    user, lang, file, pr = (read_csv(p) for p in paths)
+    assert pr == [["PR", "Tiêu đề", "Merge commit", "Ngày merge", "User", "Commit", "Code thêm",
+                   "Code xóa", "Code ròng"]]
     assert user == [
         ["User", "Bot", "Commit", "Code thêm", "Code xóa", "Code ròng", "File thay đổi",
          "Dòng thêm", "Dòng xóa"],
@@ -398,6 +408,51 @@ def test_csv_format(tmp_path: Path) -> None:
         ['a,"b".py', "", "Python", "1500", "1497", "-3"],
     ]
     assert b'"a,""b"".py"' in paths[2].read_bytes()
+
+
+def test_pr_sheet_and_csv(tmp_path: Path) -> None:
+    """TC-report-27: Theo_PR — sắp, ô PR là số / nhãn, cột rút gọn, chống công thức."""
+    merged = datetime(2026, 1, 10, 8, 0, tzinfo=BKK)
+    data = sample(pr_rows=(
+        PrRow(12, "Sửa lỗi", "b" * 40, datetime(2026, 1, 12, 9, 0, tzinfo=BKK), "alice", 1, 2, 1),
+        PrRow(None, "", "", None, "bob", 1, 1, 0),
+        PrRow(7, "=cmd", "a" * 40, merged, "bob", 1, 4, 0),
+        PrRow(7, "=cmd", "a" * 40, merged, "alice", 2, 3, 1),
+    ))
+    header = ("PR", "Tiêu đề", "Merge commit", "Ngày merge", "User", "Commit", "Code thêm",
+              "Code xóa", "Code ròng")
+    ws = xlsx(tmp_path, data)["Theo_PR"]
+    assert rows(ws) == [
+        header,
+        (7, "=cmd", "aaaaaaa", "2026-01-10", "alice", 2, 3, 1, 2),
+        (7, "=cmd", "aaaaaaa", "2026-01-10", "bob", 1, 4, 0, 4),
+        (12, "Sửa lỗi", "bbbbbbb", "2026-01-12", "alice", 1, 2, 1, 1),
+        (NO_PR_LABEL, None, None, None, "bob", 1, 1, 0, 1),
+    ]
+    assert ws["A2"].data_type == "n" and ws["B2"].data_type == "s"   # số PR; "=cmd" là chuỗi
+    assert ws.freeze_panes == "A2"
+
+    path = write_csv_reports(tmp_path, data)[3]
+    assert path.name == "loc_by_pr.csv"
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")
+    got = read_csv(path)
+    assert got[0] == list(header)
+    assert got[1] == ["7", "'=cmd", "aaaaaaa", "2026-01-10", "alice", "2", "3", "1", "2"]
+    assert got[-1] == [NO_PR_LABEL, "", "", "", "bob", "1", "1", "0", "1"]
+    assert sum(int(r[6]) for r in got[1:]) == sum(r.added_code for r in data.pr_rows)
+
+
+def test_pr_sheet_empty_default(tmp_path: Path) -> None:
+    """TC-report-28: không truyền pr_rows → chỉ tiêu đề; manifest không đổi so với trước M8."""
+    data = sample()
+    assert data.pr_rows == ()
+    assert rows(xlsx(tmp_path, data)["Theo_PR"]) == [
+        ("PR", "Tiêu đề", "Merge commit", "Ngày merge", "User", "Commit", "Code thêm",
+         "Code xóa", "Code ròng")]
+    assert len(read_csv(write_csv_reports(tmp_path, data)[3])) == 1
+    assert list(build_manifest(data, GEN)) == [
+        "tool_version", "generated_at", "repo", "branch", "timezone", "start", "end", "c_start",
+        "c_end", "users", "all_users", "config", "totals", "cross_check", "options", "exports"]
 
 
 def test_csv_formula_prefix(tmp_path: Path) -> None:
@@ -448,13 +503,18 @@ def test_build_manifest() -> None:
     assert m["users"] == ["alice", "bob"]
     assert m["all_users"] is False
     assert m["config"] == config_to_dict(AppConfig())
-    assert m["totals"] == {"loc_start": 10, "loc_end": 20, "loc_delta": 10}
-    assert list(m["totals"]) == ["loc_start", "loc_end", "loc_delta"]
+    assert m["totals"] == {"loc_start": 10, "loc_end": 20, "loc_delta": 10,
+                           "added_code": 13, "deleted_code": 3, "net_code": 10,
+                           "reported_loc_end": 20, "reported_loc_delta": 10}
+    assert list(m["totals"]) == ["loc_start", "loc_end", "loc_delta", "added_code",
+                                 "deleted_code", "net_code", "reported_loc_end",
+                                 "reported_loc_delta"]
     assert list(m["cross_check"]) == CC_KEYS
     assert m["cross_check"] == {"expected_loc_end": 20, "diff_percent": 0.0, "loc_end": 20,
                                 "sum_net_code": 10, "threshold_percent": 0.5, "ok": True}
     assert m["options"] == {"selected_users": ["alice", "bob"], "exclude_bots": False,
-                            "separate_users": True, "attribution_mode": "line"}
+                            "separate_users": True, "attribution_mode": "line",
+                            "loc_end_mode": "net_code"}
     json.dumps(m)
 
 
@@ -513,7 +573,7 @@ def test_generated_at_default_and_naive() -> None:
 # ---------- TC-19 .. TC-22: write_reports, lỗi, nhất quán ----------
 def test_write_reports_and_reproducible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                         ) -> None:
-    """TC-report-19: 6 file đúng tên, manifest ghi cuối; 2 lần → trùng SHA-256 trừ manifest."""
+    """TC-report-19: 7 file đúng tên, manifest ghi cuối; 2 lần → trùng SHA-256 trừ manifest."""
     order: list[str] = []
     for name in ("write_xlsx", "write_csv_reports", "write_warnings_csv", "write_manifest"):
         real = getattr(report, name)
@@ -529,7 +589,7 @@ def test_write_reports_and_reproducible(tmp_path: Path, monkeypatch: pytest.Monk
     assert order == ["write_xlsx", "write_csv_reports", "write_warnings_csv", "write_manifest"]
     second = write_reports(tmp_path / "two", sample(), datetime(2027, 3, 4, 5, 6, 7, tzinfo=BKK))
     names = ["loc_report.xlsx", "loc_by_user.csv", "loc_by_language.csv", "loc_by_file.csv",
-             "warnings.csv", "manifest.json"]
+             "loc_by_pr.csv", "warnings.csv", "manifest.json"]
     assert [p.name for p in first] == names
     assert all(p.parent == tmp_path / "one" for p in first)
     assert sorted(p.name for p in (tmp_path / "one").iterdir()) == sorted(names)
@@ -619,6 +679,7 @@ def test_section14_reports(section14_repo, cache_root: Path, tmp_path: Path) -> 
         languages=tuple(compare_languages(start, end)), user_rows=tuple(metrics),
         files=tuple(compare_files(start, end, rename_map(s.attr, [f.path for f in end.files]))),
         weeks=tuple(weekly_metrics(s.attr, s.commits, [A, B], "Asia/Bangkok")),
+        pr_rows=tuple(pr_metrics(s.attr, s.commits, [A, B], "Asia/Bangkok")),
         cross_check=check,
         exports=(ExportSummary("start", start_zip_name(period, s.snaps.c_start), None, None,
                                len(s.exports["start"].files), start.total_code),
@@ -633,7 +694,7 @@ def test_section14_reports(section14_repo, cache_root: Path, tmp_path: Path) -> 
         assert sha256(a) == sha256(b), a.name
     wb = load_workbook(first[0])
     assert wb.sheetnames == SHEETS
-    overview = dict(r[:2] for r in rows(wb["Tong_quan"])[1:24] if r)
+    overview = dict(r[:2] for r in rows(wb["Tong_quan"])[1:27] if r)
     assert (overview["LOC start"], overview["LOC end"], overview["Chênh lệch"],
             overview["Commit"]) == (10, 20, 10, 4)
     assert overview["User"] == "Tất cả user" and "Ghi chú" not in overview
@@ -641,8 +702,15 @@ def test_section14_reports(section14_repo, cache_root: Path, tmp_path: Path) -> 
     assert users == {A: (5, 2, 3), B: (8, 1, 7), "Tổng": (13, 3, 10)}
     weeks = rows(wb["Theo_tuan"])[1:]
     assert [w[0] for w in weeks] == ["2026-W02", "2026-W02"]
+    # TC-report-29: repo §14 không có PR → Theo_PR chỉ có nhóm không thuộc PR, Σ khớp Theo_user
+    prs = rows(wb["Theo_PR"])[1:]
+    assert [(p[0], p[4], p[5], p[6], p[7], p[8]) for p in prs] == [
+        (NO_PR_LABEL, A, 2, 5, 2, 3), (NO_PR_LABEL, B, 2, 8, 1, 7)]
+    assert [p.name for p in first][4] == "loc_by_pr.csv"
     manifest = json.loads(first[-1].read_text(encoding="utf-8"))
-    assert manifest["totals"] == {"loc_start": 10, "loc_end": 20, "loc_delta": 10}
+    assert manifest["totals"] == {"loc_start": 10, "loc_end": 20, "loc_delta": 10,
+                                  "added_code": 13, "deleted_code": 3, "net_code": 10,
+                                  "reported_loc_end": 20, "reported_loc_delta": 10}
     assert manifest["cross_check"]["diff_percent"] == 0.0
     assert manifest["cross_check"]["ok"] is True
     assert manifest["c_start"] == s.snaps.c_start.sha
@@ -669,7 +737,7 @@ def test_empty_start_all_users(tmp_path: Path) -> None:
                   exports=(ExportSummary("start", "start_2026-01-01_empty.zip", None, None, 0, 0),
                            ExportSummary("end", "end_2026-01-31_all.zip", "all", None, 3, 20,
                                          check)))
-    got = dict(r[:2] for r in rows(xlsx(tmp_path, data)["Tong_quan"])[1:23] if r)
+    got = dict(r[:2] for r in rows(xlsx(tmp_path, data)["Tong_quan"])[1:26] if r)
     assert got["C_START"] == "(rỗng)"
     assert got["Snapshot start"] == "Không có commit trước start (LOC start = 0)"
     assert got["User"] == "Tất cả user"
@@ -682,8 +750,59 @@ def test_empty_start_all_users(tmp_path: Path) -> None:
                   exports=(ExportSummary("end", "end_2026-01-31_all.zip", "all", ("alice",), 3,
                                          20, check),))
     sheet = rows(xlsx(tmp_path, bots, "b.xlsx")["Tong_quan"])
-    got = dict(r[:2] for r in sheet[1:25] if r)
+    got = dict(r[:2] for r in sheet[1:28] if r)
     assert got["User"] == "Tất cả user (loại trừ bot)"
     assert sheet[-1][:3] == ("end_2026-01-31_all.zip", "End", "Tất cả user (loại trừ bot)")
     assert got["Ghi chú"] == NOTE
     assert build_manifest(data, GEN)["c_start"] is None
+
+
+# ---------- TC-26: tổng code thêm / xóa, cách tính LOC end ----------
+def _overview(tmp_path: Path, data: ReportData, name: str) -> list[tuple]:
+    """Các hàng Mục / Giá trị của Tong_quan (tới hàng trống trước bảng export)."""
+    sheet = rows(xlsx(tmp_path, data, name)["Tong_quan"])
+    return sheet[1:sheet.index(())]
+
+
+def test_loc_end_mode(tmp_path: Path) -> None:
+    """TC-report-26: Tổng code thêm / xóa; LOC end theo code ròng (mặc định) hoặc code thêm."""
+    net = sample()
+    assert net.options.loc_end_mode == "net_code"
+    assert (net.sum_added_code, net.sum_deleted_code) == (13, 3)
+    assert (net.reported_loc_end, net.reported_loc_delta) == (20, 10)
+    labels = [r[0] for r in _overview(tmp_path, net, "net.xlsx")]
+    assert "LOC end đếm trên export" not in labels
+    assert labels[labels.index("LOC start"):labels.index("Tổng code ròng") + 1] == [
+        "LOC start", "LOC end", "Chênh lệch", "Commit", "Tổng code thêm", "Tổng code xóa",
+        "Tổng code ròng"]
+
+    added = sample(options=ReportOptions(selected_users=("alice", "bob"), separate_users=True,
+                                         loc_end_mode="added_code"))
+    assert (added.reported_loc_end, added.reported_loc_delta) == (23, 13)
+    assert added.loc_end == 20 and added.loc_delta == 10
+    got = _overview(tmp_path, added, "added.xlsx")
+    head = [r[0] for r in got]
+    start = head.index("LOC start")
+    assert got[start:start + 8] == [
+        ("LOC start", 10), ("LOC end", 23), ("Chênh lệch", 13), ("LOC end đếm trên export", 20),
+        ("Commit", 5), ("Tổng code thêm", 13), ("Tổng code xóa", 3), ("Tổng code ròng", 10)]
+    values = dict(got)
+    assert values["Cách tính LOC end"] == "Theo code thêm (LOC start + tổng code thêm)"
+    assert (values["LOC end kỳ vọng"], values["Kiểm tra chéo"]) == (20, "Đạt")
+    wb_net = xlsx(tmp_path, net, "n2.xlsx")
+    wb_added = xlsx(tmp_path, added, "a2.xlsx")
+    for name in ("Theo_ngon_ngu", "Theo_file", "Theo_user"):
+        assert rows(wb_net[name]) == rows(wb_added[name])
+
+    m = build_manifest(added, GEN)
+    assert m["totals"] == {"loc_start": 10, "loc_end": 20, "loc_delta": 10,
+                           "added_code": 13, "deleted_code": 3, "net_code": 10,
+                           "reported_loc_end": 23, "reported_loc_delta": 13}
+    assert m["cross_check"] == build_manifest(net, GEN)["cross_check"]
+    assert m["cross_check"]["loc_end"] == 20
+    assert m["options"]["loc_end_mode"] == "added_code"
+    assert report.LOC_END_MODE_LABELS == {
+        "net_code": "Theo code ròng (đếm trên export)",
+        "added_code": "Theo code thêm (LOC start + tổng code thêm)"}
+    with pytest.raises(ValueError, match="loc_end_mode"):
+        ReportOptions(loc_end_mode="x")  # type: ignore[arg-type]

@@ -204,6 +204,34 @@ Cập nhật spec `classifier`, `git_repo`, `counter`, `attribution`, `pipeline`
 Ghi chú từ review M3 (N6): `GitHubLoginResolver._save_cache` ghi lại cả file sau mỗi lần tra (O(n²)); email noreply vẫn gọi API dù suy ra được login; `requests.Session` không được đóng; `plan_export` đọc trọn blob lớn để kiểm binary.
 Tiêu chí: repo ~5.000 file, 2.000 commit trong kỳ < 5 phút trên máy 8 nhân (cần người dùng cung cấp repo đo).
 
+### M8 — Thống kê LOC theo PR của từng user
+Yêu cầu 2026-10-30. Số liệu theo user (§8.2) và theo tuần (D35) đã có; M8 thêm nhóm theo PR. Quyết định Q49–Q52 → D43 (chốt theo khuyến nghị, người dùng ủy quyền 2026-10-30; có thể đổi lại).
+
+| ID spec | Loại | File nguồn | Mục spec gốc | Phụ thuộc | Trạng thái |
+|---|---|---|---|---|---|
+| `git_repo` (cập nhật) | module | git_repo.py | §16, D43 | — | 🟢 |
+| `counter` (cập nhật) | module | counter.py | §8.2, §16, D35, D43 | git_repo, attribution | 🟢 |
+| `report` (cập nhật) | module | report.py | §12, D43 | counter | 🟢 |
+| `pipeline` (cập nhật) | module | pipeline.py | §12, D43 | counter, report | 🟢 |
+| `screen-result` (cập nhật) | screen | app.py | §10.3, D43 | pipeline | 🟢 |
+
+Thứ tự: `git_repo` → `counter` → `report` → `pipeline` → `screen-result`. `cli-analyze` không đổi (chỉ README).
+
+Phạm vi:
+- `git_repo`: `LogCommit` thêm `subject` (`%s`) và `body_title` (dòng đầu không rỗng của `%b`), mặc định `""` để code cũ không vỡ.
+- `counter`: `PrRow(pr, title, merge_sha, merged_at, account, commits, added_code, deleted_code)` + `net_code`; `pr_membership(commits)` → `dict[str, PrRef]` (commit không thuộc PR vắng mặt; tính bằng bitset tổ tiên trên đồ thị commit của kỳ); `pr_metrics(attribution, commits, accounts, timezone)` sắp `(PR tăng dần, account)`, nhóm "(Không thuộc PR)" cuối.
+- `report`: `ReportData.pr_rows`, sheet `Theo_PR` (sheet thứ 7), `loc_by_pr.csv`; tên cột tiếng Việt; chống chèn công thức như các sheet khác.
+- `pipeline`: gọi `pr_metrics`, đưa vào `ReportData.pr_rows`; liệt kê `loc_by_pr.csv` trong danh sách file đầu ra.
+- `screen-result`: mục "Theo PR của từng user" (bảng có tìm kiếm/sắp xếp sẵn của dataframe), nút tải CSV.
+
+**✅ M8 hoàn thành 2026-10-31** — 798 test pass, ruff sạch, review PASS_WITH_NOTES. Báo cáo: [reviews/M8-20261031.md](reviews/M8-20261031.md). Ghi chú còn mở (Minor): bộ nhớ bitset tổ tiên O(n²) khi kỳ có rất nhiều commit (≈68 MB ở 30 000 commit); nhóm "Không thuộc PR" hiển thị khác nhau giữa xlsx/CSV (`PR` là nhãn) và màn hình (`PR` là `<NA>`, `Tiêu đề` là nhãn).
+
+Tiêu chí hoàn thành:
+1. `uv run pytest -q` pass; `uv run ruff check src tests` sạch.
+2. Repo mẫu có PR merge (`Merge pull request #N`), squash (`(#N)`) và commit trực tiếp: số liệu từng (PR, user) đúng tay; Σ `net_code` các dòng PR = Σ `net_code` của `Theo_user` (bất biến).
+3. PR lồng nhau: commit thuộc PR trong cùng nhất. PR merge ngoài kỳ không xuất hiện.
+4. `loc_report.xlsx` có `Theo_PR`; `loc_by_pr.csv` bắt đầu `EF BB BF`; chạy 2 lần trùng SHA-256.
+
 ## 3–4. Câu hỏi mở và quyết định đã chốt
 Đã chuyển sang [DECISIONS.md](DECISIONS.md) (mục 1 Câu hỏi mở, mục 2 Quyết định đã chốt; mã Q/D giữ nguyên).
 

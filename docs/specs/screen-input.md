@@ -7,7 +7,7 @@ modules: [src/loc_counter/app.py]
 tests: [tests/test_app_input.py]
 spec_refs: ["3.1", "3.3", "3.5", "9", "10.1", "10.2", "12", "15", "16"]
 depends_on: [config, git_repo, snapshot, identity, pipeline, cli-analyze]
-status: implemented
+status: reviewed
 ---
 
 # Màn hình nhập
@@ -60,6 +60,7 @@ Ngoài phạm vi:
   Đã chọn 1 user
   [ ] Loại trừ bot   [ ] Xuất riêng từng user                  keys exclude_bots separate_users
   Cách gán tác giả: (•) Theo từng dòng  ( ) Theo commit cuối cùng   key attribution_mode
+  Cách tính LOC end: (•) Theo code ròng  ( ) Theo code thêm         key loc_end_mode
   (khu vực của screen-identity)
 ▸ Tùy chọn nâng cao (bộ lọc file, docstring, test, chế độ export)   (st.expander)
   File cấu hình: [______] [ Nạp ]                              keys config_path load_config
@@ -88,6 +89,7 @@ Thư mục đầu ra: [output]                                       key out_dir
 | Loại trừ bot | `checkbox` | `exclude_bots` | `False` | — | ẩn bot, bỏ bot khỏi `selected` |
 | Xuất riêng | `checkbox` | `separate_users` | `False` | — | — |
 | Cách gán tác giả | `radio` ngang, 2 lựa chọn `ATTRIBUTION_MODES` = ("Theo từng dòng (blame)", "Theo commit cuối cùng của file") | `attribution_mode` | lựa chọn đầu | — | đổi → `result` thành "cũ" (có trong `sig`) |
+| Cách tính LOC end | `radio` ngang, 2 lựa chọn `LOC_END_MODES` = ("Theo code ròng (đếm trên export)", "Theo code thêm (LOC start + tổng code thêm)") | `loc_end_mode` | lựa chọn đầu | — | đổi → `result` thành "cũ" (có trong `sig`) (A19) |
 | File cấu hình | `text_input` + `button("Nạp")` | `config_path`, `load_config` | `""` | `load_config`; `timezone` của file qua `canonical_timezone` (A14) | điền 8 ô nâng cao + `tz` (A6) |
 | Thư mục loại trừ | `text_area` (mỗi dòng một mục) | `adv_exclude_dirs` | `DEFAULT_EXCLUDE_DIRS` | `form_config` | — |
 | Mẫu file loại trừ | `text_area` | `adv_exclude_globs` | `DEFAULT_EXCLUDE_GLOBS` | `form_config` | — |
@@ -164,7 +166,8 @@ def analyze_blockers(*, repo_ready: bool, branch: str | None, period_error: str 
 
 def build_request(*, branch: str, period: Period, config: AppConfig, out_root: Path,
                   user_mode: str, selected: Set[str], exclude_bots: bool,
-                  separate_users: bool, attribution_mode: str = ATTRIBUTION_MODES[0]) -> AnalysisRequest:
+                  separate_users: bool, attribution_mode: str = ATTRIBUTION_MODES[0],
+                  loc_end_mode: str = LOC_END_MODES[0]) -> AnalysisRequest:
     """users = None khi 'Tất cả user', ngược lại tuple(sorted(selected))."""
 
 def progress_text(step: Step, index: int, total: int) -> str:
@@ -263,7 +266,7 @@ except (LocCounterError, OSError) as err:  st.session_state.run_error = str(err)
 except Exception:                           run_error = "Lỗi không mong đợi khi phân tích; xem run.log hoặc log của ứng dụng." (đã log trong run_log)
 st.rerun()        # chỉ khi không có BaseException khác (Rerun/Stop/KeyboardInterrupt ném tiếp — không bắt)
 ```
-`on_progress(step, i, n)`: `bar.progress((i - 1) / n, text=progress_text(step, i, n))`. `current_sig = (repo_gen, branch, period, identity_map, config, out_root_text, user_mode, tuple(sorted(selected)), exclude_bots, separate_users)` (A9).
+`on_progress(step, i, n)`: `bar.progress((i - 1) / n, text=progress_text(step, i, n))`. `current_sig = (repo_gen, branch, period, identity_map, config, out_root_text, user_mode, tuple(sorted(selected)), exclude_bots, separate_users, attribution_mode, loc_end_mode)` (A9, A18, A19).
 
 ## 6. Quy tắc nghiệp vụ & trường hợp biên
 - **Không fetch lại khi bấm Phân tích** (D41-N22): kết quả khớp snapshot đang hiển thị; muốn cập nhật bấm "Tải repo" lại.
@@ -342,6 +345,7 @@ Fixture (thêm vào `tests/conftest.py`): `make_app` — `AppTest.from_file(<src
 | TC-screen-input-22 | `analyze_blockers`, `resolve_out_root` | tổ hợp | đúng thứ tự mục 7; `""` → `PipelineError`; `~/x` → mở rộng home, tuyệt đối | unit |
 | TC-screen-input-24 | Bổ sung theo review | `canonical_timezone("singapore")`, `"utc"`, `"Mars/X"`; nạp config `timezone: singapore`; đổi token rồi trả lại; identities là thư mục / YAML hỏng; repo không có nhánh (monkeypatch `list_branches → []`); khóa `out_root` sau lỗi pipeline; lỗi `ValueError` → `run.log` có traceback | `Singapore`, `UTC`, `None`; `tz == "Singapore"`, kỳ `+08:00`; nhánh `main` được giữ; lỗi tương ứng + chặn; `Repo không có nhánh nào.`; `acquire(blocking=False)` được sau lỗi; dòng ERROR `Lỗi không mong đợi khi phân tích` + `Traceback` trong `run.log`; snapshot nằm trong khối [2] (trước subheader [3]) | unit + AppTest |
 | TC-screen-input-25 | Chọn cách gán tác giả (A18) | AppTest: (a) mặc định lựa chọn đầu; `build_request` → `attribution_mode == "line"`; (b) chọn "Theo commit cuối cùng của file" → `"last_commit"`; (c) đổi sau khi có kết quả → kết quả báo cũ (`sig` đổi); (d) E2E repo §14 (tất cả user, `last_commit`) → LOC 10/20 | AppTest |
+| TC-screen-input-26 | Chọn cách tính LOC end (A19) | AppTest: (a) mặc định lựa chọn đầu; `build_request` → `loc_end_mode == "net_code"`; (b) chọn `Theo code thêm (LOC start + tổng code thêm)` → `"added_code"`; (c) đổi sau khi có kết quả → kết quả báo cũ (`sig` đổi); (d) radio disabled khi `locked` | AppTest |
 | TC-screen-input-23 | Lựa chọn cũ khi kỳ đổi | tick alice, đổi kỳ sang 2026-01-09..20 (không có user) | `st.info` `Đã bỏ chọn user không còn trong danh sách: alice`; `Không có user nào có commit trong kỳ.` | AppTest |
 
 ## 10. Câu hỏi mở / giả định
@@ -366,6 +370,7 @@ Fixture (thêm vào `tests/conftest.py`): `make_app` — `AppTest.from_file(<src
 
 | A17 | Web UI chỉ chọn ngày: bỏ `time_input` và `selectbox` múi giờ. `start_time`/`end_time` luôn `None` (start 00:00:00, end 23:59:59); `tz` là state thuần, mặc định `Asia/Bangkok`, vẫn đổi được qua "Nạp" file cấu hình (A6, A14). CLI giữ `--start-time/--end-time/--tz` | Người dùng yêu cầu 2026-10-28 | Chốt |
 | A18 | Chọn cách gán tác giả (yêu cầu 2026-10-30): `build_request` quy `ATTRIBUTION_MODES[1]` → `AnalysisRequest.attribution_mode="last_commit"`, lựa chọn đầu → `"line"`; `attribution_mode` thêm vào `sig` (5.6). Radio khóa khi đang chạy (`locked`). TC-screen-input-25 | Khuyến nghị (ủy quyền) |
+| A19 | Chọn cách tính LOC end (yêu cầu 2026-10-30, report A15): radio `loc_end_mode` ngay dưới `Cách gán tác giả`; `build_request` quy `LOC_END_MODES[1]` → `AnalysisRequest.loc_end_mode="added_code"`, lựa chọn đầu → `"net_code"`; thêm vào `sig`; khóa khi `locked`. TC-screen-input-26 | Khuyến nghị (ủy quyền 2026-10-23) |
 
 (*) Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-23 / 2026-10-25 ("làm theo khuyến nghị"); có thể đổi lại.
 
@@ -379,3 +384,6 @@ Fixture (thêm vào `tests/conftest.py`): `make_app` — `AppTest.from_file(<src
 | 2026-10-25 | Tạo mới theo PLAN M6 + phân tích `spec-analyst` (D41). A1–A11 chốt theo khuyến nghị, người dùng ủy quyền → `approved` | M6 (`/feature-spec screen-input`) |
 | 2026-10-30 | Radio `attribution_mode` ở khối [3] (A18, TC-25), `build_request` + `sig` thêm tham số | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
 | 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | Radio `loc_end_mode` ở khối [3] (A19, TC-26), `build_request` + `sig` thêm tham số; ghi `attribution_mode` vào công thức `current_sig` (đã có từ A18) | Người dùng yêu cầu chọn cách tính LOC end theo code thêm hoặc code ròng. Chốt theo khuyến nghị, người dùng ủy quyền → `approved` |
+| 2026-10-30 | Test pass (tổng code thêm / xóa + cách tính LOC end: TC-report-26, pipeline-41, cli-analyze-27, screen-input-26, screen-result-15; toàn bộ 784 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | Test pass sau sửa theo review (toàn bộ 784 test, ruff sạch, coverage 99 %). Review PASS_WITH_NOTES (`reviews/loc-end-mode-20261030.md`), Minor 1 + Nit đã sửa → `reviewed` | /feature-review |

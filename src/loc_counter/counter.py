@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -468,6 +469,158 @@ def weekly_metrics(attribution: PeriodAttribution, commits: Sequence[LogCommit],
     rows = [WeekRow(week, start, account, *values)
             for (week, start, account), values in cells.items() if any(values)]
     rows.sort(key=lambda r: (r.week_start, r.account))
+    return rows
+
+
+# ---------- M8: theo PR (D43) ----------
+NO_PR_LABEL = "(Không thuộc PR)"
+_MERGE_PR_RE = re.compile(r"^Merge pull request #(\d+)\b")
+_SQUASH_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+@dataclass(frozen=True)
+class PrRef:
+    """Một PR nhận diện từ lịch sử git: merge commit "Merge pull request #N" hoặc squash "(#N)"."""
+
+    number: int
+    title: str
+    merge_sha: str
+    merged_at: datetime
+
+
+@dataclass(frozen=True)
+class PrRow:
+    """LOC của một account trong một PR; pr None = nhóm "Không thuộc PR"."""
+
+    pr: int | None
+    title: str
+    merge_sha: str
+    merged_at: datetime | None
+    account: str
+    commits: int
+    added_code: int
+    deleted_code: int
+
+    @property
+    def net_code(self) -> int:
+        """added_code - deleted_code."""
+        return self.added_code - self.deleted_code
+
+
+def _merge_pr_title(commit: LogCommit) -> str:
+    """Tiêu đề PR của merge commit: dòng đầu body, rồi phần sau "from ", rồi subject."""
+    if commit.body_title:
+        return commit.body_title
+    _, sep, rest = commit.subject.partition(" from ")
+    return rest.strip() if sep and rest.strip() else commit.subject
+
+
+def _ancestor_bits(commits: Sequence[LogCommit]) -> list[int]:
+    """Bitset (theo chỉ số trong commits) của mỗi commit và mọi tổ tiên nằm trong commits."""
+    index = {c.sha: i for i, c in enumerate(commits)}
+    parents = [[index[p] for p in c.parents if p in index] for c in commits]
+    anc = [0] * len(commits)
+    state = [0] * len(commits)  # 0 chưa thăm, 1 đang trên đường đi DFS, 2 đã tính xong
+    for root in range(len(commits)):
+        if state[root]:
+            continue
+        state[root] = 1
+        stack = [(root, iter(parents[root]))]
+        while stack:
+            i, todo = stack[-1]
+            for p in todo:
+                if state[p] == 0:  # state 1 = vòng (git không tạo ra): bỏ cạnh, không treo
+                    state[p] = 1
+                    stack.append((p, iter(parents[p])))
+                    break
+            else:
+                bits = 1 << i
+                for p in parents[i]:
+                    if state[p] == 2:
+                        bits |= anc[p]
+                anc[i] = bits
+                state[i] = 2
+                stack.pop()
+    return anc
+
+
+def _bit_indexes(bits: int) -> Iterator[int]:
+    """Chỉ số các bit 1 của bits, tăng dần."""
+    while bits:
+        low = bits & -bits
+        yield low.bit_length() - 1
+        bits ^= low
+
+
+def pr_membership(commits: Sequence[LogCommit]) -> dict[str, PrRef]:
+    """commit sha → PR chứa nó (D43); commit không thuộc PR nào không có khóa."""
+    index = {c.sha: i for i, c in enumerate(commits)}
+    merge_prs = [(i, c, int(m.group(1))) for i, c in enumerate(commits)
+                 if c.is_merge and (m := _MERGE_PR_RE.match(c.subject))]
+    result: dict[str, PrRef] = {}
+    if merge_prs:
+        anc = _ancestor_bits(commits)
+        groups: list[tuple[int, str, PrRef, int]] = []
+        for i, c, number in merge_prs:
+            first = index.get(c.parents[0])
+            others = 0
+            for p in c.parents[1:]:
+                if p in index:
+                    others |= anc[index[p]]
+            members = (others & ~(anc[first] if first is not None else 0)) | (1 << i)
+            ref = PrRef(number, _merge_pr_title(c), c.sha, c.author_date)
+            groups.append((members.bit_count(), c.sha, ref, members))
+        for _, _, ref, members in sorted(groups, key=lambda g: g[:2]):  # PR trong cùng nhất trước
+            for k in _bit_indexes(members):
+                result.setdefault(commits[k].sha, ref)
+    for c in commits:
+        if c.sha in result:
+            continue
+        m = _SQUASH_PR_RE.search(c.subject)
+        if m:
+            title = c.subject[:m.start()].strip() or c.subject
+            result[c.sha] = PrRef(int(m.group(1)), title, c.sha, c.author_date)
+    return result
+
+
+def pr_metrics(attribution: PeriodAttribution, commits: Sequence[LogCommit],
+               accounts: Collection[str], timezone: str) -> list[PrRow]:
+    """LOC theo (PR, account) (D43); sắp (PR tăng dần, account), nhóm không thuộc PR cuối."""
+    wanted = set(accounts)
+    membership = pr_membership(commits)
+    canonical: dict[int, PrRef] = {}  # trùng số PR: lấy PR merge sớm nhất
+    for ref in membership.values():
+        cur = canonical.get(ref.number)
+        if cur is None or (ref.merged_at, ref.merge_sha) < (cur.merged_at, cur.merge_sha):
+            canonical[ref.number] = ref
+    cells: dict[tuple[int | None, str], list[int]] = {}
+
+    def cell(sha: str, account: str) -> list[int]:
+        ref = membership.get(sha)
+        return cells.setdefault((ref.number if ref else None, account), [0, 0, 0])
+
+    acc = attribution.commit_accounts
+    for c in commits:
+        account = acc.get(c.sha)
+        if not c.is_merge and account is not None and account in wanted:
+            cell(c.sha, account)[0] += 1
+    for s in attribution.commit_stats:
+        if s.account in wanted:
+            row = cell(s.sha, s.account)
+            row[1] += s.added_code
+            row[2] += s.deleted_code
+    tz = ZoneInfo(timezone)
+    rows: list[PrRow] = []
+    for (number, account), values in cells.items():
+        if not any(values):
+            continue
+        if number is None:
+            rows.append(PrRow(None, "", "", None, account, *values))
+        else:
+            ref = canonical[number]
+            rows.append(PrRow(number, ref.title, ref.merge_sha, ref.merged_at.astimezone(tz),
+                              account, *values))
+    rows.sort(key=lambda r: (r.pr is None, r.pr or 0, r.account))
     return rows
 
 

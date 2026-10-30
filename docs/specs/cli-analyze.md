@@ -7,7 +7,7 @@ modules: [src/loc_counter/cli.py]
 tests: [tests/test_cli_analyze.py]
 spec_refs: ["3.1", "3.3", "3.5", "8.3", "10.2", "10.3", "11", "12", "15", "16"]
 depends_on: [config, git_repo, snapshot, identity, report, pipeline, cli-users]
-status: implemented
+status: reviewed
 ---
 
 # Lệnh `loc-counter analyze`
@@ -32,7 +32,7 @@ Ngoài phạm vi:
 | R5 | Bot hiện trong danh sách, `--exclude-bots` loại khỏi "Tất cả"; chọn tường minh thắng `--exclude-bots` | §3.5, §16, D40-N19 |
 | R6 | Thư mục kết quả và đủ file §12 trong `--out`; `run.log` tại `<out>/run.log` | §12, §15, D40-N12 |
 | R7 | Tiến độ theo bước (thứ tự thực): Export start → Gán tác giả → Export end → Đếm LOC → Tạo báo cáo | §10.2, D40-N16 |
-| R8 | Kết quả: Repo, nhánh, kỳ, user; LOC start / end / chênh lệch / commit; theo ngôn ngữ; theo user (+ dòng Tổng); số cảnh báo | §10.3 |
+| R8 | Kết quả: Repo, nhánh, kỳ, user; LOC start / end / chênh lệch / code thêm / code xóa / commit (A20); theo ngôn ngữ; theo user (+ dòng Tổng); số cảnh báo | §10.3 |
 | R9 | Kiểm tra chéo lệch > 0.5 % chỉ là cảnh báo | §8.3, D38 |
 | R10 | Mã thoát 0 (kể cả có cảnh báo / kiểm tra chéo lệch), 1 lỗi nghiệp vụ (thông báo tiếng Việt), 2 sai cú pháp; `--json` tùy chọn | D40-N22 |
 | R11 | `--user` khớp chính xác, rồi `casefold` nếu duy nhất; không khớp → lỗi liệt kê user trong kỳ | D40-N19 (thực hiện ở `pipeline.match_users`) |
@@ -44,6 +44,7 @@ Ngoài phạm vi:
 loc-counter analyze --repo REPO --start YYYY-MM-DD --end YYYY-MM-DD --out DIR
                     [--branch BRANCH] [--start-time HH:MM] [--end-time HH:MM] [--tz TZ]
                     [--user ACCOUNT]... [--separate-users] [--exclude-bots]
+                    [--attribution line|last-commit] [--loc-end net|added]
                     [--config PATH] [--identities PATH] [--token-env NAME] [--json]
 ```
 
@@ -58,6 +59,8 @@ loc-counter analyze --repo REPO --start YYYY-MM-DD --end YYYY-MM-DD --out DIR
 | `--user` | không, lặp được | không truyền = "Tất cả user" | giá trị thô, khớp ở `match_users` |
 | `--separate-users` | không | tắt | §3.3 |
 | `--exclude-bots` | không | tắt | §16 |
+| `--attribution` | không | `line` | `line` \| `last-commit` (A19) |
+| `--loc-end` | không | `net` | cách tính LOC end: `net` (đếm trên export ≈ LOC start + code ròng) \| `added` (LOC start + tổng code thêm) (A20) |
 | `--config` | không | mặc định §9 | |
 | `--identities` | không | không có quy tắc | D16 |
 | `--token-env` | không | không dùng token | tên biến môi trường |
@@ -70,7 +73,7 @@ Thành phần trong `cli.py` (dùng lại hàm private của spec `cli-users`: `
 @app.command("analyze")
 def analyze_command(repo, start, end, out, branch=None, start_time=None, end_time=None,
                     tz=None, user: list[str] | None = None, separate_users=False,
-                    attribution: str = "line",
+                    attribution: str = "line", loc_end: str = "net",
                     exclude_bots=False, config=None, identities=None, token_env=None,
                     json_output=False) -> None:
     """Phân tích LOC trong kỳ, xuất zip + báo cáo vào --out."""
@@ -100,8 +103,8 @@ Nhánh: main • Kỳ: 2026-01-01 00:00:00 → 2026-01-31 23:59:59 (Asia/Bangkok
 Snapshot start: a1b2c3d 2025-12-15 10:00 admin: app.py
 Snapshot end:   f9e8d7c 2026-01-08 10:00 bob del
 User: Tất cả user
-LOC start  LOC end  Chênh lệch  Commit
-       10       20         +10       4
+LOC start  LOC end  Chênh lệch  Code thêm  Code xóa  Commit
+       10       20         +10         13         3       4
 
 Theo ngôn ngữ
 Ngôn ngữ  LOC start  LOC end  Chênh lệch
@@ -122,7 +125,8 @@ Thư mục kết quả: <out_dir>
 ```
 - Dòng Repo, Nhánh/Kỳ, Snapshot: **đúng định dạng của `users`** (`_commit_text`, ngày commit theo múi giờ kỳ; C_START rỗng → `Snapshot start: (không có commit trước start)`).
 - Dòng `User:` — `all_users` → `Tất cả user`, thêm ` (loại trừ bot)` khi `options.exclude_bots`; ngược lại `", ".join(options.selected_users)`. Thêm ` • Xuất riêng từng user` khi `options.separate_users`.
-- Bảng tổng: `LOC start` = `data.loc_start`, `LOC end` = `data.loc_end`, `Chênh lệch` = `_signed(data.loc_delta)`, `Commit` = `Σ r.commits` của `data.user_rows` (không tính merge, §8.2).
+- Bảng tổng: `LOC start` = `data.loc_start`, `LOC end` = `data.reported_loc_end`, `Chênh lệch` = `_signed(data.reported_loc_delta)`, `Code thêm` = `data.sum_added_code`, `Code xóa` = `data.sum_deleted_code`, `Commit` = `Σ r.commits` của `data.user_rows` (không tính merge, §8.2). Mode `net` thì `LOC end` / `Chênh lệch` như cũ (`loc_end` / `loc_delta`).
+- Mode `added` (A20): ngay **trước** bảng tổng in dòng `Cách tính LOC end: Theo code thêm (LOC start + tổng code thêm) — LOC end đếm trên export: {data.loc_end:,}` (sau dòng `Cách gán tác giả:` nếu có). Mode `net` không in dòng này.
 - `Theo ngôn ngữ`: sắp `(-loc_end, -loc_start, language)` (như `report`); cột `LOC start`, `LOC end`, `Chênh lệch` (`_signed(delta)`). Rỗng → dòng `Không có file source nào.` thay bảng.
 - `Theo user`: sắp `(-commits, account)` (D40-N18); cột `User`, `Bot` (`bot` / rỗng), `Commit`, `Thêm` (`added_code`), `Xóa` (`deleted_code`), `Ròng` (`_signed(net_code)`), `File thay đổi` (`files_changed`); dòng `Tổng` = `counter.total_metrics(user_rows)` (cột Bot rỗng) khi có ≥ 1 dòng (A6). Rỗng → `Không có user nào có commit trong kỳ.` thay bảng, không có dòng Tổng.
 - Cột số căn phải, số có dấu phẩy hàng nghìn (`f"{n:,}"`); dùng `_format_table`. Giữa các khối một dòng trống như mẫu.
@@ -161,7 +165,7 @@ Thư mục kết quả: <out_dir>
    1. `git = _open_repo(repo, token)`;
    2. `branch = _resolve_branch(git, branch)`;
    3. `resolver = pipeline.make_resolver(git.source, identity_map, token, login_cache=identity.DEFAULT_LOGIN_CACHE)`;
-   4. `request = AnalysisRequest(branch=branch, period=period, config=cfg, out_root=out, users=users, exclude_bots=exclude_bots, separate_users=separate_users, attribution_mode=mode)` với `mode` từ `--attribution` (`line` → `"line"`, `last-commit` → `"last_commit"`; giá trị khác → mã 2 do typer);
+   4. `request = AnalysisRequest(branch=branch, period=period, config=cfg, out_root=out, users=users, exclude_bots=exclude_bots, separate_users=separate_users, attribution_mode=mode, loc_end_mode=end_mode)` với `mode` từ `--attribution` (`line` → `"line"`, `last-commit` → `"last_commit"`; giá trị khác → mã 2 do typer), `end_mode` từ `--loc-end` (`net` → `"net_code"`, `added` → `"added_code"`; giá trị khác → mã 2);
    5. `result = pipeline.run_analysis(git, request, resolver, progress=_print_progress)`;
    6. mọi `LocCounterError` / `OSError` ném ra trong khối `with` (3.1–3.5) **trừ** `PipelineError` và `SnapshotError` (pipeline đã tự log ERROR: `_error`, `prepare_period`, `logger.exception` từ bước 9 — spec `pipeline` mục 7) → `logger.error("Lỗi: %s", err)` (logger `loc_counter.cli`) **trước khi rời `with`** để `run.log` luôn có nguyên nhân (mở repo, nhánh, `GitError` trước bước 9 của pipeline); lỗi khác ném giữa chừng có thể có hai dòng ERROR (traceback của pipeline + dòng của CLI) — chấp nhận; rồi ném tiếp (A9).
 4. Ngoài `with`: bắt `LocCounterError` / `OSError` từ bước 2–3 → `raise _fail(err)` (mã 1, `Lỗi: <str(err)>`); `KeyboardInterrupt` → stderr `Đã hủy phân tích.`, `typer.Exit(130)`.
@@ -220,7 +224,7 @@ Fixture: `section14_repo` (tham số `name="repo"` để thư mục là `repo_�
 | TC-cli-analyze-03 | `--user bob` | | LOC 10 / 17; thư mục `…_bob` | integration |
 | TC-cli-analyze-04 | alice + bob, có / không `--separate-users` | `--user bob --user alice` (+ biến thể `--separate-users`) | LOC 10 / 20; thư mục `…_multi-2users`; `User: alice, bob` (+ ` • Xuất riêng từng user`); biến thể: `Bản export` có 4 dòng (start, `multi-2users`, `alice` LOC 13, `bob` LOC 17), hai dòng riêng `kiểm tra chéo: đạt` | integration |
 | TC-cli-analyze-05 | Đủ file §12 + `run.log` (mục E) | TC-01 | thư mục kết quả có `start_2026-01-01_<sha7>.zip`, `end_2026-01-31_all.zip`, `loc_report.xlsx`, 3 CSV, `warnings.csv`, `manifest.json`; `<tmp>/run.log` tồn tại, có dòng INFO `C_START=`; không có `.loc-tmp-*` | integration |
-| TC-cli-analyze-06 | `--json` | TC-01 + `--json` | stdout parse được JSON, chỉ chứa JSON; `manifest` == nội dung `manifest.json`; `out_dir` == thư mục kết quả (POSIX); `files` sắp tăng dần, đủ 8 tên; `users` thứ tự alice, bob, có `net_code`, `files_changed`; `languages[0].delta == 10`; `warnings` là list | integration |
+| TC-cli-analyze-06 | `--json` | TC-01 + `--json` | stdout parse được JSON, chỉ chứa JSON; `manifest` == nội dung `manifest.json`; `out_dir` == thư mục kết quả (POSIX); `files` sắp tăng dần, đủ 9 tên (M8: thêm loc_by_pr.csv); `users` thứ tự alice, bob, có `net_code`, `files_changed`; `languages[0].delta == 10`; `warnings` là list | integration |
 | TC-cli-analyze-07 | Tiến độ | TC-01 (cả `--json`) | stderr chứa đúng thứ tự `[1/5] Export start…` … `[5/5] Tạo báo cáo…`; không có dòng tiến độ nào trong stdout | integration |
 | TC-cli-analyze-08 | `--user` không có / casefold | `--user zz`; `--user ALICE` | `zz`: mã 1, `Lỗi: Không tìm thấy user 'zz' trong kỳ. User trong kỳ: alice, bob`, không có thư mục kết quả; `run.log` có **đúng một** dòng ERROR chứa thông báo đó; `ALICE`: mã 0, thư mục `…_alice` | integration |
 | TC-cli-analyze-09 | Không có dữ liệu | `--start 2020-01-01 --end 2020-01-31` | mã 1, `Lỗi: Không có dữ liệu trong khoảng thời gian`; `<tmp>` chỉ có `run.log` (có dòng ERROR) | integration |
@@ -239,6 +243,7 @@ Fixture: `section14_repo` (tham số `name="repo"` để thư mục là `repo_�
 | TC-cli-analyze-22 | Lỗi bất thường / Ctrl+C | monkeypatch `pipeline.run_analysis` ném (a) `OSError("đĩa đầy")`, (b) `KeyboardInterrupt`; (c) `_open_repo` ném `GitError`; (d) `--json`, `manifest.json` bị xóa sau `run_analysis` | (a) mã 1, `Lỗi: đĩa đầy`; (b) mã 130, `Đã hủy phân tích.`; (c) mã 1, `run.log` có dòng ERROR chứa thông báo; (d) mã 1, `Lỗi: Không đọc được manifest.json:`, không traceback; `app.pretty_exceptions_show_locals is False` | unit |
 | TC-cli-analyze-23 | Tham số truyền cho pipeline | spy `make_resolver`, `run_analysis` | `login_cache == identity.DEFAULT_LOGIN_CACHE` (đã monkeypatch); `AnalysisRequest.users` = `None` khi không `--user`, `("bob","alice")` theo thứ tự nhập khi có; `exclude_bots`, `separate_users`, `out_root`, `branch` đúng; `progress` khác None; không trường nào của request chứa token | unit |
 | TC-cli-analyze-26 | `--attribution` (A19) | spy `run_analysis`: (a) không tham số → `"line"`; (b) `--attribution last-commit` → `"last_commit"`, stdout có dòng `Cách gán tác giả:`; (c) `--attribution x` → mã 2 | CliRunner |
+| TC-cli-analyze-27 | `--loc-end` + cột Code thêm / Code xóa (A20) | (a) repo §14 mặc định: bảng tổng tiêu đề `LOC start  LOC end  Chênh lệch  Code thêm  Code xóa  Commit`, giá trị `10 20 +10 13 3 4`, không có dòng `Cách tính LOC end:`; (b) `--loc-end added`: `LOC end` 23, `Chênh lệch` +13, dòng `Cách tính LOC end: Theo code thêm (LOC start + tổng code thêm) — LOC end đếm trên export: 20`; kiểm tra chéo vẫn `= 20; LOC end 20 … đạt`; `--json` có `manifest.totals.loc_end == 20`, `reported_loc_end == 23`; (c) spy: không tham số → `loc_end_mode == "net_code"`, `added` → `"added_code"`; `--loc-end x` → mã 2 | CliRunner + integration |
 | TC-cli-analyze-24 | Định dạng số | `_signed(0)`, `_signed(1234)`, `_signed(-5)`; bảng có giá trị ≥ 1.000 (monkeypatch `run_analysis` trả `AnalysisResult` giả) | `"0"`, `"+1,234"`, `"-5"`; cột số căn phải, có dấu phẩy hàng nghìn; dòng `Cảnh báo: 0` khi không có cảnh báo; biến thể `languages` rỗng → dòng `Không có file source nào.` | unit |
 
 Phủ mandatory-tests mục E (đủ file, `run.log`, tên thư mục / user-tag, token, tái lập): TC-01..05, 13, 18; tiêu chí M5 số 2 (`analyze` trên repo §14): TC-01..04; số 8 (mã lỗi): TC-08..11.
@@ -258,6 +263,7 @@ Phủ mandatory-tests mục E (đủ file, `run.log`, tên thư mục / user-tag
 | A11 | `--json` đọc lại `manifest.json` lỗi → mã 1 `Lỗi: Không đọc được manifest.json: …` thay vì traceback (theo A5) | Khuyến nghị review | Chốt (*) |
 | A12 | `pretty_exceptions_show_locals=False` tường minh: typer cũ (mặc định bật) in biến cục bộ trong traceback → lộ token | Khuyến nghị review | Chốt (*) |
 | A19 | Tham số `--attribution [line\|last-commit]` (mặc định `line`): cách gán tác giả (spec `attribution` 5.10); in thêm dòng `Cách gán tác giả: Theo commit cuối cùng của file` ở bảng kết quả khi `last-commit`. TC-cli-analyze-26 | Khuyến nghị (ủy quyền 2026-10-30) |
+| A20 | Tham số `--loc-end [net\|added]` (mặc định `net`) → `AnalysisRequest.loc_end_mode` (report A15). Bảng tổng luôn thêm cột `Code thêm`, `Code xóa` (tổng của user được tính, = dòng Tổng của `Theo user`); mode `added` in thêm dòng nêu cách tính và LOC đếm trên export. TC-cli-analyze-27 | Khuyến nghị (ủy quyền 2026-10-23) |
 | A10 | Cảnh báo chỉ in số lượng (+ trỏ `warnings.csv`); chi tiết trong `--json` | Khuyến nghị, theo §10.3 "⚠ 12 cảnh báo" | Chốt (*) |
 
 (*) Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-23 ("trường hợp có hỏi xác nhận thì thực hiện theo recommend"); có thể đổi lại.
@@ -269,3 +275,7 @@ Phủ mandatory-tests mục E (đủ file, `run.log`, tên thư mục / user-tag
 | 2026-10-24 | Tạo mới theo PLAN M5 (phạm vi `cli-analyze`, D40-N19, N22) và API spec `pipeline` mục 3. A1–A10 chốt theo khuyến nghị, người dùng ủy quyền → `approved` | M5 (`/feature-spec cli-analyze`) |
 | 2026-10-30 | Thêm `--attribution line|last-commit` (A19, TC-26) | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
 | 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | Thêm `--loc-end net\|added` (A20, TC-27); bảng tổng thêm cột `Code thêm`, `Code xóa`; ghi `--attribution` vào cú pháp / bảng tham số (đã có từ A19) | Người dùng yêu cầu báo cáo thêm added_code / deleted_code và chọn cách tính LOC end. Chốt theo khuyến nghị, người dùng ủy quyền → `approved` |
+| 2026-10-30 | Test pass (tổng code thêm / xóa + cách tính LOC end: TC-report-26, pipeline-41, cli-analyze-27, screen-input-26, screen-result-15; toàn bộ 784 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | Theo review `reviews/loc-end-mode-20261030.md` (PASS_WITH_NOTES): dòng mode `added` dùng cụm từ thống nhất `LOC end đếm trên export` (Nit); TC-27 kiểm đủ dòng kiểm tra chéo `… → đạt`, `reported_loc_end` của JSON | /feature-review |
+| 2026-10-30 | Test pass sau sửa theo review (toàn bộ 784 test, ruff sạch, coverage 99 %). Review PASS_WITH_NOTES (`reviews/loc-end-mode-20261030.md`), Minor 1 + Nit đã sửa → `reviewed` | /feature-review |

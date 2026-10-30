@@ -22,7 +22,7 @@ from loc_counter.counter import CountResult, CrossCheck, count_directory, total_
 from loc_counter.git_repo import CommitInfo, GitRepo
 from loc_counter.identity import UserSummary, list_period_users, load_identities
 from loc_counter.pipeline import STEP_LABELS, AnalysisRequest, AnalysisResult, PipelineError, Step
-from loc_counter.report import MANIFEST_NAME
+from loc_counter.report import LOC_END_MODE_LABELS, MANIFEST_NAME
 from loc_counter.snapshot import Period, SnapshotError, Snapshots, find_snapshots, make_period
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,13 @@ class AttributionChoice(enum.StrEnum):
 
     LINE = "line"
     LAST_COMMIT = "last-commit"
+
+
+class LocEndChoice(enum.StrEnum):
+    """Giá trị `--loc-end` (spec report A15)."""
+
+    NET = "net"
+    ADDED = "added"
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
@@ -325,10 +332,16 @@ def _print_analysis_table(result: AnalysisResult) -> None:
     typer.echo(f"User: {who}")
     if opts.attribution_mode == "last_commit":
         typer.echo("Cách gán tác giả: Theo commit cuối cùng của file")
+    if opts.loc_end_mode == "added_code":
+        typer.echo(f"Cách tính LOC end: {LOC_END_MODE_LABELS['added_code']} — "
+                   f"LOC end đếm trên export: {data.loc_end:,}")
     commits = sum(r.commits for r in data.user_rows)
-    for line in _format_table(["LOC start", "LOC end", "Chênh lệch", "Commit"],
-                              [[f"{data.loc_start:,}", f"{data.loc_end:,}",
-                                _signed(data.loc_delta), f"{commits:,}"]], right={0, 1, 2, 3}):
+    for line in _format_table(["LOC start", "LOC end", "Chênh lệch", "Code thêm", "Code xóa",
+                               "Commit"],
+                              [[f"{data.loc_start:,}", f"{data.reported_loc_end:,}",
+                                _signed(data.reported_loc_delta), f"{data.sum_added_code:,}",
+                                f"{data.sum_deleted_code:,}", f"{commits:,}"]],
+                              right={0, 1, 2, 3, 4, 5}):
         typer.echo(line)
 
     typer.echo("")
@@ -420,6 +433,9 @@ def analyze_command(
     attribution: Annotated[AttributionChoice, typer.Option(
         "--attribution", help="Cách gán tác giả: line (theo từng dòng) hoặc last-commit "
         "(theo commit cuối cùng của file)")] = AttributionChoice.LINE,
+    loc_end: Annotated[LocEndChoice, typer.Option(
+        "--loc-end", help="Cách tính LOC end: net (đếm trên export ≈ LOC start + code ròng) "
+        "hoặc added (LOC start + tổng code thêm)")] = LocEndChoice.NET,
     config: Annotated[Path | None, typer.Option("--config", help="File config.yaml")] = None,
     identities: Annotated[Path | None, typer.Option("--identities",
                                                     help="File identities.yaml")] = None,
@@ -446,7 +462,9 @@ def analyze_command(
                                           separate_users=separate_users,
                                           attribution_mode=("last_commit" if attribution
                                                             is AttributionChoice.LAST_COMMIT
-                                                            else "line"))
+                                                            else "line"),
+                                          loc_end_mode=("added_code" if loc_end
+                                                        is LocEndChoice.ADDED else "net_code"))
                 result = pipeline.run_analysis(git, request, resolver, progress=_print_progress)
             except (LocCounterError, OSError) as err:
                 if not isinstance(err, PipelineError | SnapshotError):  # pipeline đã log (A9)

@@ -2,7 +2,7 @@
 id: screen-result
 title: Màn hình kết quả (số liệu, bảng, biểu đồ, cảnh báo, tải file)
 type: screen
-milestone: M6
+milestone: M6, M8
 modules: [src/loc_counter/app.py]
 tests: [tests/test_app_result.py]
 spec_refs: ["7.5", "8.1", "8.2", "8.3", "10.3", "12", "13", "15"]
@@ -21,7 +21,7 @@ Ngoài phạm vi: tính số liệu (đã có trong `ReportData` — pipeline/re
 | # | Yêu cầu | Mục |
 |---|---|---|
 | R1 | Dòng đầu: Repo • Nhánh • Kỳ (múi giờ); dòng "User: …" | §10.3 |
-| R2 | Bốn số: LOC start, LOC end, Chênh lệch (có dấu), Commit | §10.3, §8.1 |
+| R2 | Sáu số: LOC start, LOC end, Chênh lệch (có dấu), Code thêm, Code xóa, Commit; LOC end theo cách tính đã chọn (report A15) | §10.3, §8.1, A10 |
 | R3 | Bảng "Theo ngôn ngữ": Ngôn ngữ, LOC start, LOC end, Chênh lệch | §10.3 |
 | R4 | Bảng "Theo user": User, Commit, Thêm, Xóa, Ròng, File thay đổi; "Tất cả user" có dòng **Tổng** | §10.3, §8.2 |
 | R5 | Biểu đồ cột code ròng theo tuần, mỗi user một màu | §10.3 |
@@ -39,17 +39,19 @@ KẾT QUẢ                                                                     
 (ⓘ Kết quả ứng với tham số của lần phân tích trước; bấm PHÂN TÍCH để cập nhật.)   khi stale
 Repo: <source> • Nhánh: main • Kỳ: 2026-01-01 00:00 → 2026-01-31 23:59 (Asia/Bangkok, UTC+07:00)
 User: Tất cả user [ (loại trừ bot)] [ • Xuất riêng từng user]
-[LOC start 10] [LOC end 20] [Chênh lệch +10] [Commit 4]                       (4 × st.metric)
+[LOC start 10] [LOC end 20] [Chênh lệch +10] [Code thêm 13] [Code xóa 3] [Commit 4]   (6 × st.metric)
+(LOC end = LOC start + tổng code thêm; LOC end đếm trên export: 20)       st.caption, chỉ mode added_code
 Kiểm tra chéo: 10 + (+10) = 20; LOC end 20; lệch 0.000 % (ngưỡng 0.5 %) → đạt   (success | warning)
 Theo ngôn ngữ                     (st.dataframe, hide_index)
 Theo user                         (st.dataframe) + Tổng (st.dataframe 1 dòng, tách riêng)
 Code ròng theo tuần               (st.bar_chart x=Tuần, y=Code ròng, color=User, stack=False)
+Theo PR của từng user             (st.dataframe: PR, Tiêu đề, Merge commit, Ngày merge, User, Commit, Code thêm, Code xóa, Code ròng) + st.caption PR_NOTE   [M8]
 ⚠ 2 cảnh báo (xem chi tiết)       (st.warning) | Không có cảnh báo. (st.caption)
 ▸ Cảnh báo                        (expander: dataframe + nút tải warnings.csv)
 ▸ Chi tiết theo file              (expander: ô lọc đường dẫn, multiselect ngôn ngữ, checkbox chỉ file thay đổi, dataframe)
 Tải file
 [Tải start_…zip] [Tải end_…_all.zip] … [Tải loc_report.xlsx]
-Tải CSV: [loc_by_user.csv] [loc_by_language.csv] [loc_by_file.csv]   [Tải manifest.json]
+Tải CSV: [loc_by_user.csv] [loc_by_language.csv] [loc_by_file.csv] [loc_by_pr.csv]   [Tải manifest.json]
 Bản export end theo user dùng để kiểm tra và đếm LOC, có thể không build/chạy được.   (khi có bản dựng theo user)
 Thư mục kết quả: <out_dir>        (st.caption)
 ```
@@ -69,6 +71,8 @@ Thư mục kết quả: <out_dir>        (st.caption)
 ### 3.4 Hàm thuần (mức module, test bằng pytest thường)
 ```python
 NOTE_USER_EXPORT = "Bản export end theo user dùng để kiểm tra và đếm LOC, có thể không build/chạy được."
+PR_NOTE = ("PR nhận diện từ lịch sử git: merge commit `Merge pull request #N` hoặc commit squash "
+           "có đuôi `(#N)`; commit còn lại thuộc nhóm “(Không thuộc PR)”.")
 STALE_NOTE = "Kết quả ứng với tham số của lần phân tích trước; bấm PHÂN TÍCH để cập nhật."
 SEPARATE_SELECT_MIN = 6           # > 5 zip riêng → selectbox
 MIME = {".zip": "application/zip",
@@ -79,10 +83,12 @@ def signed(value: int) -> str:            # 0 → '0', 1234 → '+1,234', -5 →
 def header_text(data: ReportData) -> str: # dòng Repo • Nhánh • Kỳ (A2)
 def users_text(data: ReportData) -> str:  # 'User: …' như CLI cli-analyze 4.1
 def cross_check_text(check: CrossCheck) -> str   # như CLI (A3)
+def loc_end_note(data: ReportData) -> str | None # mode added_code → 'LOC end = LOC start + tổng code thêm; LOC end đếm trên export: {loc_end:,}'; net_code → None (A10)
 def language_frame(data) -> pd.DataFrame  # cột Ngôn ngữ, LOC start, LOC end, Chênh lệch; sắp (-loc_end, -loc_start, ngôn ngữ)
 def user_frame(data) -> pd.DataFrame      # cột User, Bot, Commit, Thêm, Xóa, Ròng, File thay đổi; sắp (-commit, account)
 def total_frame(data) -> pd.DataFrame | None     # 1 dòng 'Tổng' (counter.total_metrics) khi ≥ 1 user
 def weekly_frame(data) -> pd.DataFrame    # cột Tuần, Bắt đầu tuần, User, Code ròng (từ data.weeks, giữ thứ tự)
+def pr_frame(data) -> pd.DataFrame        # M8: cột PR (Int64, <NA> với nhóm không PR), Tiêu đề (nhóm không PR: counter.NO_PR_LABEL), Merge commit (7 ký tự), Ngày merge (YYYY-MM-DD), User, Commit, Code thêm, Code xóa, Code ròng (tên khác bảng user để không lẫn); sắp (PR tăng dần, account), nhóm không PR cuối
 def file_frame(data) -> pd.DataFrame      # cột Đường dẫn, Đổi tên từ, Ngôn ngữ, LOC start, LOC end, Chênh lệch; sắp đường dẫn
 def filter_files(frame, query: str, languages: Sequence[str], changed_only: bool) -> pd.DataFrame
 def warnings_frame(data) -> pd.DataFrame  # cột Loại, Đường dẫn, Nội dung, Phạm vi ('; '); sắp (path, kind) như warnings.csv
@@ -93,7 +99,7 @@ class DownloadItem:
     label: str; path: Path; mime: str; key: str; group: str   # group: 'zip' | 'report' | 'csv' | 'warnings' | 'manifest'
 
 def download_items(result: AnalysisResult) -> list[DownloadItem]:
-    """start zip, các end zip (thứ tự data.exports[1:]), xlsx, 3 CSV, warnings.csv, manifest — mọi file §12."""
+    """start zip, các end zip (thứ tự data.exports[1:]), xlsx, 4 CSV (user, language, file, pr), warnings.csv, manifest — mọi file §12 + loc_by_pr.csv."""
 ```
 Cột số là `int` (dataframe sắp xếp đúng); hiển thị bằng `column_config.NumberColumn(format="localized")`; cột "Chênh lệch", "Ròng" dùng `format="%+d"`.
 
@@ -109,14 +115,15 @@ Cột số là `int` (dataframe sắp xếp đúng); hiển thị bằng `column
 ## 5. Luồng xử lý — `render_result(result, stale, locked)`
 1. `data = result.data`; `with st.container(border=True)`: `st.subheader("KẾT QUẢ")`; `stale` → `st.info(STALE_NOTE)`.
 2. `st.text(header_text(data))`, `st.text(users_text(data))`.
-3. Bốn cột `st.metric`: `LOC start` = `f"{loc_start:,}"`, `LOC end`, `Chênh lệch` = `signed(loc_delta)`, `Commit` = `f"{Σ user_rows.commits:,}"` (không tính merge, §8.2).
+3. Sáu cột `st.metric`: `LOC start` = `f"{loc_start:,}"`, `LOC end` = `f"{reported_loc_end:,}"`, `Chênh lệch` = `signed(reported_loc_delta)`, `Code thêm` = `f"{sum_added_code:,}"`, `Code xóa` = `f"{sum_deleted_code:,}"`, `Commit` = `f"{Σ user_rows.commits:,}"` (không tính merge, §8.2). `loc_end_note(data)` khác `None` → `st.caption(note)` ngay dưới (A10).
 4. `cross_check_text(data.cross_check)` → `st.success` khi `ok`, ngược lại `st.warning` (R10).
 5. "Theo ngôn ngữ": `language_frame` rỗng → `st.caption("Không có file source nào.")`, ngược lại `st.dataframe(hide_index=True)`.
 6. "Theo user": `user_frame` rỗng → `st.caption("Không có user nào có commit trong kỳ.")`; ngược lại dataframe + `total_frame` vẽ **riêng** (dataframe 1 dòng, không sắp lẫn) (D41-N16).
 7. "Code ròng theo tuần": `weekly_frame` rỗng → `st.caption("Không có commit trong kỳ.")`; ngược lại `st.bar_chart(frame, x="Tuần", y="Code ròng", color="User", stack=False)`.
+7b. (M8, D43) "Theo PR của từng user": `pr_frame` rỗng → `st.caption("Không có commit trong kỳ.")`; ngược lại `st.dataframe(hide_index=True)` rồi `st.caption(PR_NOTE)`. Không có dòng nào có số PR (mọi dòng là nhóm không PR) → thêm `st.caption("Không tìm thấy PR nào trong lịch sử của kỳ.")`.
 8. Cảnh báo: `n = len(data.warnings)`; `n > 0` → `st.warning(f"{n} cảnh báo (xem chi tiết)", icon="⚠️")` (Streamlit coi emoji đầu chuỗi là icon), ngược lại `st.caption("Không có cảnh báo.")`; `st.expander("Cảnh báo")`: `warnings_frame` (rỗng → caption) + nút tải `warnings.csv`.
 9. `st.expander("Chi tiết theo file")`: ô lọc (3.2) → `filter_files(file_frame(data), …)` → `st.dataframe(hide_index=True)` + `st.caption(f"{len(filtered):,} / {len(all):,} file")`.
-10. "Tải file": `items = download_items(result)`; zip start + zip end chính + xlsx một hàng cột; zip riêng: ≤ 5 → mỗi zip một nút; > 5 → selectbox `dl_separate_pick` + một nút `dl_separate`; "Tải CSV:" 3 nút; manifest. Mỗi nút: file không còn → `disabled` + `st.caption`.
+10. "Tải file": `items = download_items(result)`; zip start + zip end chính + xlsx một hàng cột; zip riêng: ≤ 5 → mỗi zip một nút; > 5 → selectbox `dl_separate_pick` + một nút `dl_separate`; "Tải CSV:" 4 nút; manifest. Mỗi nút: file không còn → `disabled` + `st.caption`.
 11. `has_user_export(data)` → `st.caption(NOTE_USER_EXPORT)` (R9). Cuối: `st.caption(f"Thư mục kết quả: {result.out_dir}")`.
 
 `data` của nút tải là callable `functools.partial(Path.read_bytes, path)` (đọc khi bấm, không giữ bytes trong bộ nhớ ở mỗi rerun — D41-N13); `on_click="ignore"` (không rerun).
@@ -158,13 +165,16 @@ Fixture: `analysis` (module scope) — dựng `section14_repo`-tương đương 
 | TC-screen-result-05 | Biểu đồ tuần | §14 | `weekly_frame` cột `Tuần, Bắt đầu tuần, User, Code ròng`, tổng `Code ròng` theo user = net (alice 3, bob 7); AppTest có phần tử biểu đồ | unit + AppTest |
 | TC-screen-result-06 | Chi tiết theo file | `file_frame` + `filter_files` | 2 hàng `app.py`, `util.py`; lọc `UTIL` → 1; ngôn ngữ `["Python"]` → 2; `changed_only` → hàng có chênh lệch ≠ 0; repo đổi tên → cột `Đổi tên từ` | unit |
 | TC-screen-result-07 | Cảnh báo + kiểm tra chéo | repo ca lệch (`build_cross_check_mismatch`) | `warnings_frame` có `cross_check`, phạm vi `kiểm tra chéo`; AppTest cảnh báo icon `⚠️` nội dung `1 cảnh báo (xem chi tiết)`, dòng kiểm tra chéo trong `st.warning` kết thúc `VƯỢT NGƯỠNG (xem warnings.csv)`; §14 → `Không có cảnh báo.` + `st.success` | unit + AppTest |
-| TC-screen-result-08 | Tải mọi file (tiêu chí M6) | alice + bob xuất riêng | `{i.path.name for i in download_items(r)} == set(os.listdir(r.out_dir))` (10 file: 4 zip + 6 báo cáo); `i.path.read_bytes()` = bytes file; mime theo đuôi; nhóm `csv` có 3 mục; AppTest có đủ `download_button` (key `dl_<tên>`) và không disabled | unit + AppTest |
+| TC-screen-result-08 | Tải mọi file (tiêu chí M6) | alice + bob xuất riêng | `{i.path.name for i in download_items(r)} == set(os.listdir(r.out_dir))` (11 file: 4 zip + 7 báo cáo); `i.path.read_bytes()` = bytes file; mime theo đuôi; nhóm `csv` có 4 mục (thêm `loc_by_pr.csv`); AppTest có đủ `download_button` (key `dl_<tên>`) và không disabled | unit + AppTest |
 | TC-screen-result-09 | Nhiều zip riêng | `download_items` giả với 7 zip riêng (AnalysisResult dựng tay) | AppTest (hoặc hàm chia nhóm) → 1 selectbox `dl_separate_pick` 7 lựa chọn + 1 nút | unit + AppTest |
 | TC-screen-result-10 | File không còn | xóa `warnings.csv` sau khi chạy rồi rerun | nút `dl_warnings.csv` disabled; caption `Không còn file: warnings.csv` | AppTest |
 | TC-screen-result-11 | Dòng đầu / ghi chú | `header_text` §14 Bangkok; giờ start 08:30 tz UTC; chỉ alice | `Repo: … • Nhánh: main • Kỳ: 2026-01-01 00:00 → 2026-01-31 23:59 (Asia/Bangkok, UTC+07:00)`; `… 08:30 → … (UTC, UTC+00:00)`; alice → `has_user_export` True, caption `NOTE_USER_EXPORT`; tất cả → False | unit + AppTest |
 | TC-screen-result-12 | Kết quả cũ | chạy rồi đổi end | `st.info(STALE_NOTE)`; số liệu cũ vẫn hiện | AppTest |
 | TC-screen-result-13 | Định dạng | `signed(0/1234/-5)`, `users_text`, `cross_check_text` | `0`, `+1,234`, `-5`; `User: Tất cả user (loại trừ bot) • Xuất riêng từng user`; `User: alice, bob`; dòng kiểm tra chéo như CLI | unit |
 | TC-screen-result-14 | Khóa khi chạy | `locked=True` (fake run như TC-screen-input-15) | mọi `download_button` và ô lọc file disabled | AppTest |
+| TC-screen-result-15 | Code thêm / xóa + cách tính LOC end (A10) | (a) AppTest §14 mặc định; (b) `loc_end_note` với `ReportData` mode `added_code`; (c) AppTest §14 chọn cách tính `Theo code thêm` | (a) 6 metric nhãn `LOC start, LOC end, Chênh lệch, Code thêm, Code xóa, Commit` giá trị `10, 20, +10, 13, 3, 4`; không caption ghi chú; `loc_end_note` → `None`; (b) `LOC end = LOC start + tổng code thêm; LOC end đếm trên export: 20`; (c) `LOC end` `23`, `Chênh lệch` `+13`, có caption (b); dòng kiểm tra chéo vẫn `LOC end 20 … đạt` | unit + AppTest |
+
+| TC-screen-result-16 | Theo PR của từng user (M8) | (a) `pr_frame` với `ReportData.pr_rows` gồm PR 12 alice, nhóm không PR bob, PR 7 bob, PR 7 alice; (b) `pr_frame` khi `pr_rows=()`; (c) AppTest §14 tất cả (repo không có PR) | (a) cột đúng thứ tự; dtype cột `PR` là `Int64`; hàng sắp `(7, alice), (7, bob), (12, alice), (nhóm không PR, bob)`; nhóm không PR: `PR` là `<NA>`, `Tiêu đề == "(Không thuộc PR)"`, `Merge commit`, `Ngày merge` rỗng; `Code ròng = Code thêm − Code xóa`; (b) rỗng; (c) có tiêu đề `**Theo PR của từng user**`, 1 dataframe PR (2 hàng alice, bob; Σ `Code thêm` = 13), caption `PR_NOTE` và caption `Không tìm thấy PR nào trong lịch sử của kỳ.`; nút `dl_loc_by_pr.csv` có và không disabled | unit + AppTest |
 
 ## 10. Câu hỏi mở / giả định
 | # | Nội dung | Phương án | Trạng thái |
@@ -178,6 +188,8 @@ Fixture: `analysis` (module scope) — dựng `section14_repo`-tương đương 
 | A7 | Ngưỡng > 5 zip riêng → selectbox | D41-N13 | Chốt (*) |
 | A8 | Bộ lọc "chỉ file thay đổi" dựa trên LOC / đổi tên (dữ liệu `FileRow` không có cờ "có sửa"); nhãn ghi rõ `Chỉ file có LOC thay đổi hoặc đổi tên` | Khuyến nghị review | Chốt (*) |
 | A9 | Định dạng số: metric `1,234` (chuỗi); bảng giữ cột số nguyên để sắp xếp đúng, hiển thị `localized` (theo trình duyệt) và `%+d` cho chênh lệch / ròng (0 hiện `+0`) — chấp nhận khác biệt nhỏ | Khuyến nghị review (giữ §3.4) | Chốt (*) |
+| A10 | (yêu cầu 2026-10-30) Metric thêm `Code thêm` / `Code xóa` (tổng của user được tính = dòng Tổng của bảng user); `LOC end` / `Chênh lệch` theo `ReportData.reported_loc_end` / `reported_loc_delta` (report A15); mode `added_code` hiện caption nêu cách tính và LOC đếm trên export. Bảng ngôn ngữ / file không đổi (luôn đếm trên export). TC-screen-result-15 | Khuyến nghị (ủy quyền 2026-10-23) |
+| A11 | (M8, D43) Bảng "Theo PR của từng user" hiện trực tiếp (không đặt trong expander) vì là yêu cầu chính; cột `PR` kiểu `Int64` để sắp số đúng; không thêm bộ lọc riêng (dataframe đã có tìm kiếm / sắp xếp). TC-screen-result-16 | Khuyến nghị (ủy quyền 2026-10-30) |
 
 (*) Chốt theo khuyến nghị, người dùng ủy quyền ("làm theo khuyến nghị", 2026-10-25); có thể đổi lại.
 
@@ -186,3 +198,8 @@ Fixture: `analysis` (module scope) — dựng `section14_repo`-tương đương 
 |---|---|---|
 | 2026-10-25 | Theo review `reviews/screen-result-20261025.md` (FAIL — Major `streamlit>=1.66` chưa nâng): nâng trong `pyproject.toml` + `uv lock`; A8 nhãn bộ lọc; A9 định dạng số; test TC-04, 06, 08, 14 chặt hơn. Chốt theo khuyến nghị | review Major + Minor |
 | 2026-10-25 | Tạo mới theo PLAN M6 + D41. A1–A7 chốt theo khuyến nghị, người dùng ủy quyền → `approved` | M6 (`/feature-spec screen-result`) |
+| 2026-10-30 | Metric `Code thêm`, `Code xóa`; `LOC end` / `Chênh lệch` theo cách tính LOC end; `loc_end_note` + caption mode `added_code` (A10, TC-15). `reviewed` → `approved` | Người dùng yêu cầu báo cáo thêm added_code / deleted_code và chọn cách tính LOC end. Chốt theo khuyến nghị, người dùng ủy quyền |
+| 2026-10-30 | Test pass (tổng code thêm / xóa + cách tính LOC end: TC-report-26, pipeline-41, cli-analyze-27, screen-input-26, screen-result-15; toàn bộ 784 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-30 | Theo review `reviews/loc-end-mode-20261030.md` (PASS_WITH_NOTES): ghi chú mode `added_code` dùng cụm từ thống nhất `LOC end đếm trên export` (Nit) | /feature-review |
+| 2026-10-30 | M8 (D43): mục "Theo PR của từng user" (`pr_frame`, `PR_NOTE`), 4 nút CSV (thêm `loc_by_pr.csv`), `download_items` 11 file; TC-08 cập nhật, TC-16, A11. Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | PLAN M8, D43 |
+| 2026-10-30 | Test pass sau sửa theo review (toàn bộ 784 test, ruff sạch, coverage 99 %). Review PASS_WITH_NOTES (`reviews/loc-end-mode-20261030.md`), Minor 1 + Nit đã sửa → `reviewed` | /feature-review |

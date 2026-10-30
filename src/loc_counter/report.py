@@ -22,9 +22,11 @@ from openpyxl.utils import get_column_letter
 from loc_counter import __version__
 from loc_counter.config import AppConfig, LocCounterError, config_to_dict
 from loc_counter.counter import (
+    NO_PR_LABEL,
     CrossCheck,
     FileRow,
     LanguageRow,
+    PrRow,
     UserMetrics,
     WarningKind,
     WeekRow,
@@ -43,11 +45,16 @@ XLSX_NAME = "loc_report.xlsx"
 USER_CSV_NAME = "loc_by_user.csv"
 LANGUAGE_CSV_NAME = "loc_by_language.csv"
 FILE_CSV_NAME = "loc_by_file.csv"
+PR_CSV_NAME = "loc_by_pr.csv"
 WARNINGS_CSV_NAME = "warnings.csv"
 MANIFEST_NAME = "manifest.json"
 ATTRIBUTION_MODE_LABELS = {"line": "Theo từng dòng",
                            "last_commit": "Theo commit cuối cùng của file"}
-SHEET_NAMES = ("Tong_quan", "Theo_ngon_ngu", "Theo_user", "Theo_file", "Theo_tuan", "Canh_bao")
+LocEndMode = Literal["net_code", "added_code"]
+LOC_END_MODE_LABELS = {"net_code": "Theo code ròng (đếm trên export)",
+                       "added_code": "Theo code thêm (LOC start + tổng code thêm)"}
+SHEET_NAMES = ("Tong_quan", "Theo_ngon_ngu", "Theo_user", "Theo_file", "Theo_tuan", "Theo_PR",
+               "Canh_bao")
 XLSX_MAX_CELL_CHARS = 32767
 
 SCOPE_START = "start"
@@ -111,6 +118,11 @@ class ReportOptions:
     exclude_bots: bool = False
     separate_users: bool = False
     attribution_mode: str = "line"
+    loc_end_mode: LocEndMode = "net_code"
+
+    def __post_init__(self) -> None:
+        if self.loc_end_mode not in LOC_END_MODE_LABELS:
+            raise ValueError(f"loc_end_mode không hợp lệ: {self.loc_end_mode!r}")
 
 
 @dataclass(frozen=True)
@@ -136,6 +148,7 @@ class ReportData:
     warnings: tuple[ReportWarning, ...] = ()
     exports: tuple[ExportSummary, ...] = ()
     tool_version: str = __version__
+    pr_rows: tuple[PrRow, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.cross_check.loc_start != self.loc_start
@@ -144,8 +157,30 @@ class ReportData:
 
     @property
     def loc_delta(self) -> int:
-        """loc_end - loc_start."""
+        """loc_end - loc_start (LOC đếm trên export)."""
         return self.loc_end - self.loc_start
+
+    @property
+    def sum_added_code(self) -> int:
+        """Tổng code thêm của các user được tính."""
+        return sum(r.added_code for r in self.user_rows)
+
+    @property
+    def sum_deleted_code(self) -> int:
+        """Tổng code xóa của các user được tính."""
+        return sum(r.deleted_code for r in self.user_rows)
+
+    @property
+    def reported_loc_end(self) -> int:
+        """LOC end theo cách tính đã chọn (A15): net_code → loc_end; added_code → start + thêm."""
+        if self.options.loc_end_mode == "added_code":
+            return self.loc_start + self.sum_added_code
+        return self.loc_end
+
+    @property
+    def reported_loc_delta(self) -> int:
+        """reported_loc_end - loc_start."""
+        return self.reported_loc_end - self.loc_start
 
 
 # ---------- chuẩn hóa ----------
@@ -168,6 +203,10 @@ def _sorted_files(rows: Iterable[FileRow]) -> list[FileRow]:
 
 def _sorted_weeks(rows: Iterable[WeekRow]) -> list[WeekRow]:
     return sorted(rows, key=lambda r: (r.week_start, r.account))
+
+
+def _sorted_prs(rows: Iterable[PrRow]) -> list[PrRow]:
+    return sorted(rows, key=lambda r: (r.pr is None, r.pr or 0, r.account))
 
 
 def _sorted_warnings(rows: Iterable[ReportWarning]) -> list[ReportWarning]:
@@ -207,6 +246,17 @@ _FILE_COLUMNS: tuple[_Column, ...] = (
 _WEEK_COLUMNS: tuple[_Column, ...] = (
     ("Tuần", lambda r: r.week, None),
     ("Ngày bắt đầu", lambda r: r.week_start.isoformat(), None),
+    ("User", lambda r: r.account, None),
+    ("Commit", lambda r: r.commits, _INT),
+    ("Code thêm", lambda r: r.added_code, _INT),
+    ("Code xóa", lambda r: r.deleted_code, _INT),
+    ("Code ròng", lambda r: r.net_code, _DELTA),
+)
+_PR_COLUMNS: tuple[_Column, ...] = (
+    ("PR", lambda r: NO_PR_LABEL if r.pr is None else r.pr, None),
+    ("Tiêu đề", lambda r: r.title, None),
+    ("Merge commit", lambda r: r.merge_sha[:7], None),
+    ("Ngày merge", lambda r: r.merged_at.strftime("%Y-%m-%d") if r.merged_at else "", None),
     ("User", lambda r: r.account, None),
     ("Commit", lambda r: r.commits, _INT),
     ("Code thêm", lambda r: r.added_code, _INT),
@@ -304,11 +354,18 @@ def _overview_sheet(ws: Worksheet, data: ReportData) -> None:
         ("User", user_text, None),
         ("Cách gán tác giả", ATTRIBUTION_MODE_LABELS.get(data.options.attribution_mode,
                                                          data.options.attribution_mode), None),
+        ("Cách tính LOC end", LOC_END_MODE_LABELS[data.options.loc_end_mode], None),
         ("Số user được tính", len(data.users), _INT),
         ("LOC start", data.loc_start, _INT),
-        ("LOC end", data.loc_end, _INT),
-        ("Chênh lệch", data.loc_delta, _DELTA),
+        ("LOC end", data.reported_loc_end, _INT),
+        ("Chênh lệch", data.reported_loc_delta, _DELTA),
+    ]
+    if data.options.loc_end_mode == "added_code":
+        items.append(("LOC end đếm trên export", data.loc_end, _INT))
+    items += [
         ("Commit", total_metrics(list(data.user_rows)).commits, _INT),
+        ("Tổng code thêm", data.sum_added_code, _INT),
+        ("Tổng code xóa", data.sum_deleted_code, _INT),
         ("Tổng code ròng", check.sum_net_code, _DELTA),
         ("LOC end kỳ vọng", check.expected_loc_end, _INT),
         ("Lệch kiểm tra chéo (%)", check.diff_percent, _PERCENT),
@@ -381,18 +438,19 @@ def _normalize_xlsx(raw: bytes, c_end: CommitInfo, timezone: str) -> bytes:
 
 
 def write_xlsx(path: Path, data: ReportData) -> Path:
-    """loc_report.xlsx 6 sheet, chuẩn hóa tái lập (D40-N14)."""
+    """loc_report.xlsx 7 sheet, chuẩn hóa tái lập (D40-N14)."""
     wb = Workbook()
     sheets = [wb.active]
     sheets[0].title = SHEET_NAMES[0]
     sheets += [wb.create_sheet(name) for name in SHEET_NAMES[1:]]
-    overview, languages, users, files, weeks, warns = sheets
+    overview, languages, users, files, weeks, prs, warns = sheets
     _overview_sheet(overview, data)
     user_rows = _sorted_users(data.user_rows)
     _table_sheet(languages, _LANGUAGE_COLUMNS, _sorted_languages(data.languages))
     _table_sheet(users, _USER_COLUMNS, user_rows, total=total_metrics(user_rows))
     _table_sheet(files, _FILE_COLUMNS, _sorted_files(data.files))
     _table_sheet(weeks, _WEEK_COLUMNS, _sorted_weeks(data.weeks))
+    _table_sheet(prs, _PR_COLUMNS, _sorted_prs(data.pr_rows))
     _table_sheet(warns, _WARNING_COLUMNS, _sorted_warnings(data.warnings))
     for ws in sheets:
         _fit_columns(ws)
@@ -422,13 +480,14 @@ def _write_csv(path: Path, columns: Sequence[_Column], items: Iterable[Any]) -> 
 
 
 def write_csv_reports(out_dir: Path, data: ReportData) -> list[Path]:
-    """loc_by_user.csv, loc_by_language.csv, loc_by_file.csv (thứ tự này)."""
+    """loc_by_user.csv, loc_by_language.csv, loc_by_file.csv, loc_by_pr.csv (thứ tự này)."""
     out_dir = Path(out_dir)
     return [
         _write_csv(out_dir / USER_CSV_NAME, _USER_COLUMNS, _sorted_users(data.user_rows)),
         _write_csv(out_dir / LANGUAGE_CSV_NAME, _LANGUAGE_COLUMNS,
                    _sorted_languages(data.languages)),
         _write_csv(out_dir / FILE_CSV_NAME, _FILE_COLUMNS, _sorted_files(data.files)),
+        _write_csv(out_dir / PR_CSV_NAME, _PR_COLUMNS, _sorted_prs(data.pr_rows)),
     ]
 
 
@@ -482,13 +541,18 @@ def build_manifest(data: ReportData, generated_at: datetime | None = None) -> di
         "all_users": data.all_users,
         "config": config_to_dict(data.config),
         "totals": {"loc_start": data.loc_start, "loc_end": data.loc_end,
-                   "loc_delta": data.loc_delta},
+                   "loc_delta": data.loc_delta, "added_code": data.sum_added_code,
+                   "deleted_code": data.sum_deleted_code,
+                   "net_code": total_metrics(list(data.user_rows)).net_code,
+                   "reported_loc_end": data.reported_loc_end,
+                   "reported_loc_delta": data.reported_loc_delta},
         "cross_check": _cross_check_dict(data.cross_check),
         "options": {
             "selected_users": list(selected) if selected is not None else None,
             "exclude_bots": data.options.exclude_bots,
             "separate_users": data.options.separate_users,
             "attribution_mode": data.options.attribution_mode,
+            "loc_end_mode": data.options.loc_end_mode,
         },
         "exports": [_export_dict(e) for e in data.exports],
     }
@@ -513,7 +577,7 @@ def write_manifest(path: Path, manifest: Mapping[str, Any]) -> Path:
 
 def write_reports(out_dir: Path, data: ReportData,
                   generated_at: datetime | None = None) -> list[Path]:
-    """Ghi đủ 6 file vào out_dir; manifest ghi cuối cùng. Trả đường dẫn theo thứ tự cố định."""
+    """Ghi đủ 7 file vào out_dir; manifest ghi cuối cùng. Trả đường dẫn theo thứ tự cố định."""
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         logger.error("Thư mục kết quả không tồn tại hoặc không phải thư mục: %s", out_dir)

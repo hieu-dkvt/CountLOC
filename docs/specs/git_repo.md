@@ -5,7 +5,7 @@ type: module
 milestone: M2, M3, M4
 modules: [src/loc_counter/git_repo.py]
 tests: [tests/test_git_repo.py]
-spec_refs: ["3.1", "3.5", "4", "7.1", "7.2", "7.4", "10.2", "11", "15"]
+spec_refs: ["3.1", "3.5", "4", "7.1", "7.2", "7.4", "10.2", "11", "15", "16"]
 depends_on: [config]
 status: reviewed
 ---
@@ -129,6 +129,8 @@ class LogCommit:
     mapped_name: str            # %aN (sau .mailmap)
     mapped_email: str           # %aE (sau .mailmap)
     author_date: datetime       # %aI, aware
+    subject: str = ""           # %s — dòng tiêu đề (M8, D43)
+    body_title: str = ""        # M8: dòng đầu không rỗng của %b (đã strip), "" nếu body rỗng
 
     @property
     def is_merge(self) -> bool: ...
@@ -281,8 +283,8 @@ class GitRepo:  # (tiếp)
 
 ### 5.10 `log_commits(c_end, c_start, mailmap_rev)`
 1. Tùy chọn mailmap: `-c mailmap.file=` (tắt file toàn cục) và `-c mailmap.blob=<mailmap_rev>:.mailmap` (rỗng khi `mailmap_rev is None` → tắt `.mailmap`, kể cả `HEAD:.mailmap` mặc định của bare repo). Commit không có `.mailmap` → git bỏ qua, không lỗi (đã kiểm chứng).
-2. `git <mailmap opts> log --no-color --format=%x1e%H%x00%P%x00%an%x00%ae%x00%aN%x00%aE%x00%aI <c_end> [^<c_start>] --`.
-3. Tách bản ghi theo `\x1e`, bỏ rỗng; mỗi bản ghi `rstrip("\n")` rồi tách `\0` thành 7 trường; `parents = tuple(P.split())`; `author_date = datetime.fromisoformat(aI)`. Giải mã UTF-8 (`errors="replace"`). `%H` không khớp `[0-9a-f]{40}` → GitError.
+2. `git <mailmap opts> log --no-color --format=%x1e%H%x00%P%x00%an%x00%ae%x00%aN%x00%aE%x00%aI%x00%s%x00%b <c_end> [^<c_start>] --` (M8: thêm `%s`, `%b`).
+3. Tách bản ghi theo `\x1e`, bỏ rỗng; mỗi bản ghi `rstrip("\n")` rồi tách `\0` thành 9 trường; `parents = tuple(P.split())`; `author_date = datetime.fromisoformat(aI)`; `subject = s.strip()`; `body_title` = dòng đầu tiên không rỗng của `b.splitlines()` sau `strip()` (không có → `""`). Giải mã UTF-8 (`errors="replace"`). `%H` không khớp `[0-9a-f]{40}` hoặc số trường ≠ 9 → GitError. (Git không cho NUL trong commit message nên `\0` không xuất hiện trong `%s`/`%b`.)
 4. Trả list theo thứ tự `git log` (mặc định: mới → cũ, tái lập với cùng repo).
 
 ### 5.11 Quy ước chung cho các lệnh M4
@@ -451,6 +453,7 @@ Fixture `make_repo` (conftest): repo nguồn tạm, `GIT_AUTHOR_DATE`/`GIT_COMMI
 A
 B` mã 0; mã 128; mã 1 với stdout khác rỗng | (a) `[c1]`; (b) 2 SHA sắp tăng dần, khớp tập `git merge-base --all`; (c) `[]`; (d) GitError `Không đọc được kết quả merge-base.`; (e) `[A, B]`; GitError `returncode == 128` (stderr đã che); GitError `returncode == 1` | integration + unit |
 | TC-git_repo-54 | Mật khẩu trong URL / scp | `ssh://u:s3cret@h/o/r`, `SSH://u:s3cret@h:22/o/r`, `git://u:s3cret@h/o/r`, `file://u:s3cret@h/o/r`, `git+ssh://u:s3cret@h/o/r`, `ftp://u:s3cret@h/o/r`, `us:s3cret@h:o/r.git`, `u~x:s3cret@h:o/r`, `us:s3@cret@h:o/r` (user ≥ 2 ký tự: `X:` một chữ cái là ổ đĩa); mật khẩu chứa `#`, `?`, `/`: `ssh://u:s3#cret@h/o/r`, `ssh://u:s3?cret@h/o/r`, `ssh://u:s3/cret@h/o/r`, `git://u:s3#cret@h/o/r`, `https://u:s3#cret@github.com/o/r`, `https://u:s3/cret@github.com/o/r`; hợp lệ: `ssh://git@h/o/r`, `ssh://git@h:22/o/r/`, `ssh://h/o/r`, `git+ssh://git@h/o/r`, `ssh+git://git@h/o/r`, `git@h:o/r.git`; local không tồn tại `<tmp>/u:s3cret@x` và `<tmp>/a@b`; `GitRepo.open("ssh://u:s3cret@h/o/r")`, `GitRepo.open("file://u:s3#cret@h/o/r")`; `ext::sh -c x`, `fd::0`, `FD::0,1`; thư mục có thật tên dạng scp (monkeypatch `Path.is_dir` → True cho `repo:2024`, vì Windows không tạo được tên có `:`) | `::` → GitError `Không hỗ trợ nguồn dạng`, không chứa `sh -c`; `repo:2024` → `(đường dẫn tuyệt đối, True)`; ca có mật khẩu → GitError `thông tin xác thực`; hợp lệ → `(s.rstrip("/"), False)`; local → GitError `Không tìm thấy repo: ***@…` (phần trước `@` cuối bị che); mọi thông báo và caplog không chứa `s3cret` / `cret`; `open` ném GitError trước khi chạy lệnh git nào ngoài `--version` (spy `subprocess`) | unit |
+| TC-git_repo-55 | log_commits trả subject và body_title (M8) | commit 1: message `Thêm login (#12)` (không body); commit 2: message `Merge pull request #7 from org/feat` + body `\n\nFix lỗi đăng nhập\n\nchi tiết`; commit 3: message `Tiêu đề` + body chỉ có dòng trống; commit 4: message có ký tự Unicode | (1) `subject == "Thêm login (#12)"`, `body_title == ""`; (2) `subject == "Merge pull request #7 from org/feat"`, `body_title == "Fix lỗi đăng nhập"`; (3) `body_title == ""`; (4) Unicode giữ nguyên; các trường cũ (sha, parents, author, date) không đổi so với TC-25; bản ghi git log có số trường ≠ 9 (monkeypatch) → GitError `Không đọc được danh sách commit trong kỳ.` | integration + unit |
 | TC-git_repo-17 | mask_secrets | text chứa token và base64 của `x-access-token:<token>` | cả hai thành `***` | unit |
 | TC-git_repo-18 | Phân loại lỗi git | monkeypatch stderr: `Authentication failed`, `Repository not found`, `Could not resolve host: github.com`, lỗi khác | đúng 4 thông báo tiếng Việt mục 7 | unit |
 | TC-git_repo-19 | Repo rỗng | nguồn `git init` chưa commit | open OK, `list_branches() == []`, `default_branch()` None | integration |
@@ -493,3 +496,4 @@ B` mã 0; mã 128; mã 1 với stdout khác rỗng | (a) `[c1]`; (b) 2 SHA sắp
 | 2026-10-25 | Test pass (TC-54 mở rộng, 84 test) → `implemented` | /feature-test |
 | 2026-10-25 | Review r2 PASS_WITH_NOTES (`reviews/git_repo-password-20261025-r2.md`): 5.3 từ chối `<transport>::` (Minor 2); dạng scp là thư mục có thật → local (Minor 1); README ghi chú Azure DevOps `org@`. TC-54 thêm ca. Chốt theo khuyến nghị, người dùng ủy quyền | Review r2 Minor 1, 2, ghi chú 4 |
 | 2026-10-25 | Toàn bộ 750 test pass, coverage 99 % → `reviewed` | /feature-test all |
+| 2026-10-30 | M8 (D43): `LogCommit` thêm `subject`, `body_title` (mặc định `""`); 5.10 đổi `--format` thành 9 trường; TC-55. Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | PLAN M8, D43 |

@@ -26,7 +26,7 @@ from loc_counter.config import (
     config_from_dict,
     load_config,
 )
-from loc_counter.counter import CrossCheck, total_metrics
+from loc_counter.counter import NO_PR_LABEL, CrossCheck, total_metrics
 from loc_counter.git_repo import CommitInfo, GitRepo, cache_dir_for, normalize_source
 from loc_counter.identity import (
     AccountResolver,
@@ -48,7 +48,9 @@ from loc_counter.pipeline import (
 from loc_counter.report import (
     FILE_CSV_NAME,
     LANGUAGE_CSV_NAME,
+    LOC_END_MODE_LABELS,
     MANIFEST_NAME,
+    PR_CSV_NAME,
     USER_CSV_NAME,
     WARNINGS_CSV_NAME,
     XLSX_NAME,
@@ -61,6 +63,7 @@ logger = logging.getLogger("loc_counter.app")  # script chạy dưới tên __ma
 SOURCE_QUOTES = "\"'"
 USER_MODES = ("Tất cả user", "Chọn user")
 ATTRIBUTION_MODES = ("Theo từng dòng (blame)", "Theo commit cuối cùng của file")
+LOC_END_MODES = (LOC_END_MODE_LABELS["net_code"], LOC_END_MODE_LABELS["added_code"])
 DEFAULT_OUT_DIR = "output"
 DEFAULT_IDENTITIES = "identities.yaml"
 FORM_KEYS = ("exclude_dirs", "exclude_globs", "exclude_languages", "exclude_binary",
@@ -210,13 +213,15 @@ def analyze_blockers(*, repo_ready: bool, branch: str | None, period_error: str 
 def build_request(*, branch: str, period: Period, config: AppConfig, out_root: Path,
                   user_mode: str, selected: Set[str], exclude_bots: bool,
                   separate_users: bool,
-                  attribution_mode: str = ATTRIBUTION_MODES[0]) -> AnalysisRequest:
+                  attribution_mode: str = ATTRIBUTION_MODES[0],
+                  loc_end_mode: str = LOC_END_MODES[0]) -> AnalysisRequest:
     """users = None khi 'Tất cả user', ngược lại tuple(sorted(selected))."""
     users = None if user_mode == USER_MODES[0] else tuple(sorted(selected))
     mode = "last_commit" if attribution_mode == ATTRIBUTION_MODES[1] else "line"
+    end_mode = "added_code" if loc_end_mode == LOC_END_MODES[1] else "net_code"
     return AnalysisRequest(branch=branch, period=period, config=config, out_root=out_root,
                            users=users, exclude_bots=exclude_bots, separate_users=separate_users,
-                           attribution_mode=mode)
+                           attribution_mode=mode, loc_end_mode=end_mode)
 
 
 def progress_text(step: Step, index: int, total: int) -> str:
@@ -243,12 +248,14 @@ LOCKS = LockRegistry()  # singleton tiến trình — script lấy qua module g�
 # ---------- hàm thuần của màn hình kết quả (spec screen-result) ----------
 NOTE_USER_EXPORT = ("Bản export end theo user dùng để kiểm tra và đếm LOC, "
                     "có thể không build/chạy được.")
+PR_NOTE = ("PR nhận diện từ lịch sử git: merge commit `Merge pull request #N` hoặc commit squash "
+           "có đuôi `(#N)`; commit còn lại thuộc nhóm “(Không thuộc PR)”.")
 STALE_NOTE = "Kết quả ứng với tham số của lần phân tích trước; bấm PHÂN TÍCH để cập nhật."
 SEPARATE_SELECT_MIN = 6
 MIME = {".zip": "application/zip",
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".csv": "text/csv", ".json": "application/json"}
-_CSV_NAMES = (USER_CSV_NAME, LANGUAGE_CSV_NAME, FILE_CSV_NAME)
+_CSV_NAMES = (USER_CSV_NAME, LANGUAGE_CSV_NAME, FILE_CSV_NAME, PR_CSV_NAME)
 
 
 def signed(value: int) -> str:
@@ -279,6 +286,14 @@ def users_text(data: ReportData) -> str:
     return f"User: {who}"
 
 
+def loc_end_note(data: ReportData) -> str | None:
+    """Ghi chú cách tính LOC end khi theo code thêm (A10); mode net_code → None."""
+    if data.options.loc_end_mode != "added_code":
+        return None
+    return ("LOC end = LOC start + tổng code thêm; LOC end đếm trên export: "
+            f"{data.loc_end:,}")
+
+
 def cross_check_text(check: CrossCheck) -> str:
     """Dòng kiểm tra chéo, cùng định dạng với CLI."""
     verdict = "đạt" if check.ok else "VƯỢT NGƯỠNG (xem warnings.csv)"
@@ -291,6 +306,8 @@ _LANGUAGE_COLUMNS = ["Ngôn ngữ", "LOC start", "LOC end", "Chênh lệch"]
 _USER_COLUMNS = ["User", "Bot", "Commit", "Thêm", "Xóa", "Ròng", "File thay đổi"]
 _WEEK_COLUMNS = ["Tuần", "Bắt đầu tuần", "User", "Code ròng"]
 _FILE_COLUMNS = ["Đường dẫn", "Đổi tên từ", "Ngôn ngữ", "LOC start", "LOC end", "Chênh lệch"]
+_PR_COLUMNS = ["PR", "Tiêu đề", "Merge commit", "Ngày merge", "User", "Commit", "Code thêm",
+               "Code xóa", "Code ròng"]
 _WARNING_COLUMNS = ["Loại", "Đường dẫn", "Nội dung", "Phạm vi"]
 
 
@@ -324,6 +341,17 @@ def weekly_frame(data: ReportData) -> pd.DataFrame:
     """Code ròng theo tuần ISO và user (giữ thứ tự của report)."""
     return pd.DataFrame([[w.week, w.week_start, w.account, w.net_code] for w in data.weeks],
                         columns=_WEEK_COLUMNS)
+
+
+def pr_frame(data: ReportData) -> pd.DataFrame:
+    """LOC theo PR của từng user (D43); sắp (PR tăng dần, account), nhóm không PR cuối."""
+    rows = sorted(data.pr_rows, key=lambda r: (r.pr is None, r.pr or 0, r.account))
+    frame = pd.DataFrame(
+        [[r.pr, NO_PR_LABEL if r.pr is None else r.title, r.merge_sha[:7],
+          r.merged_at.strftime("%Y-%m-%d") if r.merged_at else "", r.account, r.commits,
+          r.added_code, r.deleted_code, r.net_code] for r in rows], columns=_PR_COLUMNS)
+    frame["PR"] = frame["PR"].astype("Int64")  # <NA> cho nhóm không PR, vẫn sắp số đúng
+    return frame
 
 
 def file_frame(data: ReportData) -> pd.DataFrame:
@@ -372,7 +400,7 @@ class DownloadItem:
 
 
 def download_items(result: AnalysisResult) -> list[DownloadItem]:
-    """start zip, các end zip, xlsx, 3 CSV, warnings.csv, manifest — mọi file §12."""
+    """start zip, các end zip, xlsx, 4 CSV (gồm loc_by_pr.csv), warnings.csv, manifest."""
     def item(path: Path, group: str) -> DownloadItem:
         return DownloadItem(f"Tải {path.name}", path,
                             MIME.get(path.suffix, "application/octet-stream"),
@@ -469,7 +497,7 @@ def _init_state() -> None:
         "end_date": end, "end_time": None, "tz": DEFAULT_TIMEZONE,
         "identities_path": DEFAULT_IDENTITIES, "user_mode": USER_MODES[0], "user_query": "",
         "exclude_bots": False, "separate_users": False, "config_path": "",
-        "attribution_mode": ATTRIBUTION_MODES[0],
+        "attribution_mode": ATTRIBUTION_MODES[0], "loc_end_mode": LOC_END_MODES[0],
         "out_dir": DEFAULT_OUT_DIR, "repo": None, "loaded_with": None, "repo_gen": 0,
         "branches": [], "branch_value": None, "repo_error": None, "period_memo": {},
         "selected": set(), "run_requested": False, "run_error": None, "result": None,
@@ -633,6 +661,8 @@ def _render_users(locked: bool, ctx: PeriodContext | None, identity_map: Identit
     with right:
         st.checkbox("Xuất riêng từng user", key="separate_users", disabled=locked)
     st.radio("Cách gán tác giả", ATTRIBUTION_MODES, key="attribution_mode", horizontal=True,
+             disabled=locked)
+    st.radio("Cách tính LOC end", LOC_END_MODES, key="loc_end_mode", horizontal=True,
              disabled=locked)
     if ctx is not None:
         for warning in ctx.users.warnings:
@@ -798,7 +828,8 @@ def _run_analysis(repo: GitRepo | None, token: str, ctx: PeriodContext | None,
                                         out_root=out_root, user_mode=ss.user_mode,
                                         selected=ss.selected, exclude_bots=ss.exclude_bots,
                                         separate_users=ss.separate_users,
-                                        attribution_mode=ss.attribution_mode)
+                                        attribution_mode=ss.attribution_mode,
+                                        loc_end_mode=ss.loc_end_mode)
                 try:
                     result = pipeline.run_analysis(repo, request, resolver,
                                                    progress=on_progress, context=ctx)
@@ -821,7 +852,7 @@ _INT = st.column_config.NumberColumn(format="localized")
 _DELTA = st.column_config.NumberColumn(format="%+d")
 _TABLE_CONFIG = {"LOC start": _INT, "LOC end": _INT, "Chênh lệch": _DELTA, "Commit": _INT,
                  "Thêm": _INT, "Xóa": _INT, "Ròng": _DELTA, "File thay đổi": _INT,
-                 "Code ròng": _DELTA}
+                 "Code ròng": _DELTA, "Code thêm": _INT, "Code xóa": _INT}
 
 
 def _table(frame: pd.DataFrame) -> None:
@@ -876,10 +907,16 @@ def render_result(result: AnalysisResult, stale: bool, locked: bool) -> None:
         st.text(header_text(data))
         st.text(users_text(data))
         commits = sum(r.commits for r in data.user_rows)
-        for column, (label, value) in zip(st.columns(4), (
-                ("LOC start", f"{data.loc_start:,}"), ("LOC end", f"{data.loc_end:,}"),
-                ("Chênh lệch", signed(data.loc_delta)), ("Commit", f"{commits:,}")), strict=True):
+        for column, (label, value) in zip(st.columns(6), (
+                ("LOC start", f"{data.loc_start:,}"), ("LOC end", f"{data.reported_loc_end:,}"),
+                ("Chênh lệch", signed(data.reported_loc_delta)),
+                ("Code thêm", f"{data.sum_added_code:,}"),
+                ("Code xóa", f"{data.sum_deleted_code:,}"), ("Commit", f"{commits:,}")),
+                strict=True):
             column.metric(label, value)
+        note = loc_end_note(data)
+        if note is not None:
+            st.caption(note)
         check = cross_check_text(data.cross_check)
         (st.success if data.cross_check.ok else st.warning)(check)
 
@@ -903,6 +940,15 @@ def render_result(result: AnalysisResult, stale: bool, locked: bool) -> None:
             st.caption("Không có commit trong kỳ.")
         else:
             st.bar_chart(weeks, x="Tuần", y="Code ròng", color="User", stack=False)
+        st.markdown("**Theo PR của từng user**")
+        prs = pr_frame(data)
+        if prs.empty:
+            st.caption("Không có commit trong kỳ.")
+        else:
+            _table(prs)
+            st.caption(PR_NOTE)
+            if prs["PR"].isna().all():
+                st.caption("Không tìm thấy PR nào trong lịch sử của kỳ.")
 
         count = len(data.warnings)
         if count:
@@ -975,7 +1021,8 @@ def main() -> None:
     st.button("PHÂN TÍCH", key="analyze", type="primary", on_click=_request_run,
               disabled=bool(blockers) or locked)
     sig = (ss.repo_gen, branch, period, identity_map, config, ss.out_dir, ss.user_mode,
-           tuple(sorted(ss.selected)), ss.exclude_bots, ss.separate_users, ss.attribution_mode)
+           tuple(sorted(ss.selected)), ss.exclude_bots, ss.separate_users, ss.attribution_mode,
+           ss.loc_end_mode)
     if ss.run_error:
         st.error(ss.run_error)
     if ss.result is not None:

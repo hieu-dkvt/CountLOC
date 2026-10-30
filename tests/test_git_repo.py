@@ -506,6 +506,31 @@ def test_log_commits_period(make_repo, cache_root: Path) -> None:
     assert {c.sha for c in all_commits} == {c0, c1, c2, m, c3}
 
 
+def test_log_commits_subject_and_body_title(make_repo, cache_root: Path,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-git_repo-55: log_commits trả subject và body_title (M8, D43)."""
+    src = make_repo()
+    c1 = src.commit("Thêm login (#12)", "2026-01-02T10:00:00+07:00", files={"a.py": "x = 1\n"})
+    c2 = src.commit("Merge pull request #7 from org/feat\n\nFix lỗi đăng nhập\n\nchi tiết",
+                    "2026-01-03T10:00:00+07:00", files={"a.py": "x = 2\n"})
+    c3 = src.commit("Tiêu đề", "2026-01-04T10:00:00+07:00", files={"a.py": "x = 3\n"})
+    c4 = src.commit("Đổi tên ñ → é", "2026-01-05T10:00:00+07:00", files={"a.py": "x = 4\n"})
+    repo = GitRepo.open(str(src.path), cache_root=cache_root)
+
+    by_sha = {c.sha: c for c in repo.log_commits(c4, None)}
+    assert (by_sha[c1].subject, by_sha[c1].body_title) == ("Thêm login (#12)", "")
+    assert by_sha[c2].subject == "Merge pull request #7 from org/feat"
+    assert by_sha[c2].body_title == "Fix lỗi đăng nhập"
+    assert (by_sha[c3].subject, by_sha[c3].body_title) == ("Tiêu đề", "")
+    assert by_sha[c4].subject == "Đổi tên ñ → é"
+    assert by_sha[c1].author_date == datetime(2026, 1, 2, 10, tzinfo=BKK)  # trường cũ không đổi
+
+    bad = f"\x1e{c1}\0\0a\0a@x\0a\0a@x\0{by_sha[c1].author_date.isoformat()}\0chỉ-7-trường"
+    monkeypatch.setattr(repo, "run", lambda args, **kwargs: bad.encode())
+    with pytest.raises(GitError, match="Không đọc được danh sách commit trong kỳ"):
+        repo.log_commits(c4)
+
+
 def test_log_commits_mailmap(make_repo, cache_root: Path, tmp_path: Path,
                              monkeypatch: pytest.MonkeyPatch) -> None:
     """TC-git_repo-26: .mailmap lấy tại mailmap_rev; mailmap.file toàn cục bị bỏ qua."""

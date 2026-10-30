@@ -43,6 +43,7 @@ from loc_counter.counter import (
     count_export,
     cross_check,
     cross_check_warning,
+    pr_metrics,
     rename_map,
     user_metrics,
     weekly_metrics,
@@ -60,7 +61,9 @@ from loc_counter.identity import (
 from loc_counter.report import (
     FILE_CSV_NAME,
     LANGUAGE_CSV_NAME,
+    LOC_END_MODE_LABELS,
     MANIFEST_NAME,
+    PR_CSV_NAME,
     SCOPE_ATTRIBUTION,
     SCOPE_CROSS_CHECK,
     SCOPE_IDENTITY,
@@ -69,6 +72,7 @@ from loc_counter.report import (
     WARNINGS_CSV_NAME,
     XLSX_NAME,
     ExportSummary,
+    LocEndMode,
     ReportData,
     ReportOptions,
     ReportWarning,
@@ -100,8 +104,8 @@ WINDOWS_MAX_PATH = 259            # khi Windows chưa bật long path
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _PACKAGE_LOGGER = "loc_counter"
 _MANIFEST_KEYS = ("tool_version", "c_end", "exports")
-_REPORT_NAMES = (XLSX_NAME, USER_CSV_NAME, LANGUAGE_CSV_NAME, FILE_CSV_NAME, WARNINGS_CSV_NAME,
-                 MANIFEST_NAME)
+_REPORT_NAMES = (XLSX_NAME, USER_CSV_NAME, LANGUAGE_CSV_NAME, FILE_CSV_NAME, PR_CSV_NAME,
+                 WARNINGS_CSV_NAME, MANIFEST_NAME)
 _LIST_MAX = 20
 _SOURCE_SPLIT_RE = re.compile(r"[/\\:]")
 _LONG_PATHS_KEY = r"SYSTEM\CurrentControlSet\Control\FileSystem"
@@ -148,6 +152,7 @@ class AnalysisRequest:
     exclude_bots: bool = False
     separate_users: bool = False
     attribution_mode: AttributionMode = "line"
+    loc_end_mode: LocEndMode = "net_code"
 
 
 @dataclass(frozen=True)
@@ -481,6 +486,8 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
     order = list(Step)
     if request.attribution_mode not in ("line", "last_commit"):
         raise ValueError(f"attribution_mode không hợp lệ: {request.attribution_mode!r}")
+    if request.loc_end_mode not in LOC_END_MODE_LABELS:
+        raise ValueError(f"loc_end_mode không hợp lệ: {request.loc_end_mode!r}")
 
     def step(s: Step) -> None:
         if progress is not None:
@@ -568,6 +575,7 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
                               rename_map(attr, [f.path for f in main_export.files]))
         user_rows = user_metrics(attr, summaries, counted)
         weeks = weekly_metrics(attr, commits, counted, tz)
+        pr_rows = pr_metrics(attr, commits, counted, tz)
         check = cross_check(loc_start, loc_end, [r.net_code for r in user_rows])
         net_by_account = {r.account: r.net_code for r in user_rows}
         separate_checks = [
@@ -586,6 +594,10 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
             logger.info("Kiểm tra chéo %s: loc_start %d + Σ net %+d = %d, loc_end %d, "
                         "lệch %.3f%%", job.tag, c.loc_start, c.sum_net_code, c.expected_loc_end,
                         c.loc_end, c.diff_percent)
+        if request.loc_end_mode == "added_code":
+            added = sum(r.added_code for r in user_rows)
+            logger.info("LOC end theo code thêm: %d + %d = %d (đếm trên export: %d)", loc_start,
+                        added, loc_start + added, loc_end)
 
         # Bước 5 — Tạo báo cáo
         step(Step.REPORT)
@@ -612,10 +624,11 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
             c_end=snaps.c_end, users=counted, all_users=selected is None,
             config=dataclasses.replace(cfg, timezone=tz),
             options=ReportOptions(selected, request.exclude_bots, request.separate_users,
-                                  request.attribution_mode),
+                                  request.attribution_mode, request.loc_end_mode),
             loc_start=loc_start, loc_end=loc_end, languages=tuple(languages),
             user_rows=tuple(user_rows), files=tuple(files), weeks=tuple(weeks),
-            cross_check=check, warnings=warnings, exports=tuple(summaries_out))
+            pr_rows=tuple(pr_rows), cross_check=check, warnings=warnings,
+            exports=tuple(summaries_out))
         generated_at = (now or (lambda: datetime.now(ZoneInfo(tz)).replace(microsecond=0)))()
         report_files = write_reports(tmp, data, generated_at)
         _commit_dir(tmp, final)

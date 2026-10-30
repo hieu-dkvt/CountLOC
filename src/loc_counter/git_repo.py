@@ -107,6 +107,8 @@ class LogCommit:
     mapped_name: str
     mapped_email: str
     author_date: datetime
+    subject: str = ""
+    body_title: str = ""
 
     @property
     def is_merge(self) -> bool:
@@ -613,7 +615,7 @@ class GitRepo:
         """
         blob = f"{mailmap_rev}:.mailmap" if mailmap_rev else ""
         args = ["-c", "mailmap.file=", "-c", f"mailmap.blob={blob}", "log", "--no-color",
-                "--format=%x1e%H%x00%P%x00%an%x00%ae%x00%aN%x00%aE%x00%aI", c_end]
+                "--format=%x1e%H%x00%P%x00%an%x00%ae%x00%aN%x00%aE%x00%aI%x00%s%x00%b", c_end]
         if c_start:
             args.append(f"^{c_start}")
         args.append("--")
@@ -623,12 +625,13 @@ class GitRepo:
             if not record.strip():
                 continue
             fields = record.rstrip("\n").split("\0")
-            if len(fields) != 7 or not _SHA_RE.fullmatch(fields[0]):
+            if len(fields) != 9 or not _SHA_RE.fullmatch(fields[0]):
                 logger.warning("Kết quả git log không hợp lệ: %r", record[:80])
                 raise GitError("Không đọc được danh sách commit trong kỳ.")
-            sha, parents, an, ae, mn, me, date = fields
+            sha, parents, an, ae, mn, me, date, subject, body = fields
+            body_title = next((s for s in map(str.strip, body.splitlines()) if s), "")
             commits.append(LogCommit(sha, tuple(parents.split()), an, ae, mn, me,
-                                     _parse_commit_date(date, sha)))
+                                     _parse_commit_date(date, sha), subject.strip(), body_title))
         return commits
 
     # ----- diff, blame (M4) -----

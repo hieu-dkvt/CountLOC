@@ -22,17 +22,17 @@ Sửa hành vi sau khi duyệt → cập nhật spec, ghi "Lịch sử thay đ�
 | [config](config.md) | module | M1 | reviewed |
 | [filters](filters.md) | module | M1 | reviewed |
 | [classifier](classifier.md) | module | M1 | reviewed |
-| [counter](counter.md) | module | M1, M4, M5 | reviewed |
+| [counter](counter.md) | module | M1, M4, M5, M8 | reviewed |
 | [cli-count](cli-count.md) | cli | M1 | reviewed |
-| [git_repo](git_repo.md) | module | M2, M3, M4 | reviewed |
+| [git_repo](git_repo.md) | module | M2, M3, M4, M8 | reviewed |
 | [snapshot](snapshot.md) | module | M2, M3, M4 | reviewed |
 | [identity](identity.md) | module | M3 | reviewed |
 | [cli-users](cli-users.md) | cli | M3 | reviewed |
 | [attribution](attribution.md) | module | M4, M5 | reviewed |
 | [builder](builder.md) | module | M4, M5 | reviewed |
-| [report](report.md) | module | M5 | reviewed |
-| [pipeline](pipeline.md) | module | M5 | reviewed |
+| [report](report.md) | module | M5, M8 | reviewed |
+| [pipeline](pipeline.md) | module | M5, M8 | reviewed |
 | [cli-analyze](cli-analyze.md) | cli | M5 | reviewed |
 | [screen-input](screen-input.md) | screen | M6 | reviewed |
-| [screen-result](screen-result.md) | screen | M6 | reviewed |
+| [screen-result](screen-result.md) | screen | M6, M8 | reviewed |
 | [screen-identity](screen-identity.md) | screen | M6 | reviewed |
