@@ -42,9 +42,27 @@ Với mỗi test fail, phân loại: **bug code** / **test sai** / **spec mơ h�
 - Không bao giờ sửa giá trị kỳ vọng để khớp code. Nghi giá trị kỳ vọng trong spec sai → hỏi người dùng.
 - Khi gọi từ `/feature-implement`: sửa bug code rồi chạy lại. Gọi độc lập: báo cáo, đề xuất sửa, hỏi người dùng có sửa không.
 
+## Bước 5b — Truy nguyên quy trình
+Sau khi phân loại, hỏi thêm: **vì sao lỗi này lọt qua quy trình?** Xác định thành phần quy trình còn thiếu:
+
+| Triệu chứng | Thành phần thiếu | File cần sửa |
+|---|---|---|
+| Code khớp spec nhưng test fail vì biên/lỗi/định dạng spec không nêu | Spec thiếu | `docs/specs/<id>.md` (qua `/feature-spec`) |
+| Spec đúng nhưng trường hợp biên không được `spec-analyst` nêu | Prompt agent thiếu checklist | `.claude/agents/spec-analyst.md` |
+| Kỳ vọng hoặc fixture của test sai (múi giờ, CRLF, ngày commit…) | Quy ước agent thiếu | `.claude/agents/test-engineer.md` |
+| Review PASS nhưng lỗi vẫn lọt | Checklist review thiếu mục | `.claude/skills/feature-review/checklist.md` |
+| Claude bỏ qua một bước, hoặc không giao việc cho agent dù nên giao | Câu chữ skill mơ hồ, hoặc `description` agent không khớp | `.claude/skills/*/SKILL.md`, `.claude/agents/*.md` |
+| Cùng loại lỗi lặp ở nhiều feature | Quy tắc chung thiếu | `CLAUDE.md` |
+
+Chỉ lỗi do **bug code thuần** (spec, test, quy trình đều đúng) thì không cần ghi.
+Với mỗi lỗi thuộc dòng khác, ghi một dòng vào [docs/process-feedback.md](../../../docs/process-feedback.md) theo mẫu trong file đó.
+Nếu cùng "thành phần thiếu" đã xuất hiện **từ 2 lần** trong nhật ký, hoặc lỗi thuộc loại Blocker (sai kết quả đếm, lộ token) → trình bày **đề xuất sửa cụ thể** (câu/mục cần thêm vào file nào) cho người dùng.
+**Không tự sửa** `.claude/` hay `CLAUDE.md`: chờ người dùng duyệt. Sau khi sửa, đổi cột Trạng thái của dòng nhật ký thành `đã áp dụng` và kiểm chứng bằng cách chạy lại ca đã fail.
+
 ## Bước 6 — Báo cáo
 Ghi `docs/test-reports/<phạm vi>-<YYYYMMDD>.md` và tóm tắt cho người dùng:
 - Tổng pass/fail/skip, coverage của các module trong phạm vi (mục tiêu ≥ 85% cho module lõi).
 - Bảng truy vết TC (đủ / thiếu / fail).
 - Danh sách test bắt buộc còn thiếu (nếu có).
 - Tiêu chí milestone: đạt / chưa đạt / chưa kiểm được.
+- Mục "Phản hồi quy trình": các dòng mới ghi vào `docs/process-feedback.md` ở bước 5b và đề xuất sửa đang chờ duyệt (nếu có).

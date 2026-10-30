@@ -7,7 +7,7 @@ modules: [src/loc_counter/counter.py]
 tests: [tests/test_counter.py, tests/test_counter_metrics.py]
 spec_refs: ["3.3", "3.4", "6.3", "7.2", "7.3", "7.4", "7.5", "8.1", "8.2", "8.3", "9", "10.3", "12", "15", "16"]
 depends_on: [config, filters, classifier, attribution, builder, identity]
-status: reviewed
+status: implemented
 ---
 
 # Đếm LOC và số liệu
@@ -330,9 +330,9 @@ Không kiểm lại binary / bộ lọc đường dẫn: `language` đã là k�
    - `commits = by_summary[a].commits` (không tính merge, D15); `is_bot = by_summary[a].is_bot`. `a` không có trong `summaries` → `commits = 0`, `is_bot = False`, log WARNING `Account %s không có trong danh sách user của kỳ` (người gọi dùng resolver khác).
    - `added_lines, deleted_lines, added_code, deleted_code` lấy từ `stats[a]` (không có → 0). Không phân loại lại.
    - `files` = các `f.path` (khử trùng, sắp tăng dần) của `attribution.files` thỏa **cả hai**:
-     a. `f.granularity == "lines"` và (`a in f.added_by.values()` hoặc `a in f.deleted_by.values()` hoặc `f.renamed_by == a`);
+     a. `f.granularity in ("lines", "last")` và (`a in f.added_by.values()` hoặc `a in f.deleted_by.values()` hoặc `f.renamed_by == a`);
      b. ít nhất một phía là source được đếm: `side is not None and side.keep and side.language is not None and not side.too_large`.
-     File `whole` / `skip` (binary, quá lớn, symlink…) không tính; rename thuần (100 %) = 1 file; user chỉ đổi khoảng trắng (không có dòng nào được gán) không tính.
+     (Mode `last_commit`: `"last"` có `added_by` / `deleted_by` nên tính như `"lines"`; file binary `"last"` không có dòng nào được gán nên không tính.) File `whole` / `skip` (binary, quá lớn, symlink…) không tính; rename thuần (100 %) = 1 file; user chỉ đổi khoảng trắng (không có dòng nào được gán) không tính.
 3. Sắp `(-commits, account)`.
 
 `total_metrics(rows)`: `UserMetrics("", False, Σcommits, Σadded_lines, Σdeleted_lines, Σadded_code, Σdeleted_code, files = sorted(hợp các rows.files))` — `files_changed` của dòng Tổng là số file **khác nhau** (hai user sửa cùng file tính 1). `rows` rỗng → mọi số 0.
@@ -484,3 +484,5 @@ M5 — file `tests/test_counter_metrics.py` (repo §14 = fixture `section14_repo
 | 2026-10-24 | Chốt A6–A11 theo khuyến nghị (người dùng ủy quyền) → `approved` | Duyệt (*) |
 | 2026-10-24 | Test pass (TC-01..44; 50 test counter, toàn bộ 545) → `implemented` | /feature-test |
 | 2026-10-24 | Sửa theo review (reviews/counter-20261024.md, PASS_WITH_NOTES) — làm rõ, không đổi kết quả trên luồng chính: 5.4 đóng iterator khi có `close()` (Minor 2); 5.9 so ngưỡng bằng phân số chính xác (Minor 3); TC-25 thêm ca lỗi phía người đọc (Minor 1); `user_metrics` gom file một lượt (Minor 5). Minor 4 (`iso_week` nhận datetime naive) giữ nguyên: đầu vào luôn aware (`LogCommit.author_date`). Chốt theo khuyến nghị (người dùng ủy quyền) → `reviewed` | /feature-review |
+| 2026-10-30 | 5.7: `files` tính cả `granularity == "last"` (spec `attribution` 5.10); không đổi với mode `line` | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
+| 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |

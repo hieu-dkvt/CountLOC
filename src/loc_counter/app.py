@@ -10,7 +10,7 @@ import os
 import threading
 from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, available_timezones
@@ -60,6 +60,7 @@ logger = logging.getLogger("loc_counter.app")  # script chạy dưới tên __ma
 
 SOURCE_QUOTES = "\"'"
 USER_MODES = ("Tất cả user", "Chọn user")
+ATTRIBUTION_MODES = ("Theo từng dòng (blame)", "Theo commit cuối cùng của file")
 DEFAULT_OUT_DIR = "output"
 DEFAULT_IDENTITIES = "identities.yaml"
 FORM_KEYS = ("exclude_dirs", "exclude_globs", "exclude_languages", "exclude_binary",
@@ -208,11 +209,14 @@ def analyze_blockers(*, repo_ready: bool, branch: str | None, period_error: str 
 
 def build_request(*, branch: str, period: Period, config: AppConfig, out_root: Path,
                   user_mode: str, selected: Set[str], exclude_bots: bool,
-                  separate_users: bool) -> AnalysisRequest:
+                  separate_users: bool,
+                  attribution_mode: str = ATTRIBUTION_MODES[0]) -> AnalysisRequest:
     """users = None khi 'Tất cả user', ngược lại tuple(sorted(selected))."""
     users = None if user_mode == USER_MODES[0] else tuple(sorted(selected))
+    mode = "last_commit" if attribution_mode == ATTRIBUTION_MODES[1] else "line"
     return AnalysisRequest(branch=branch, period=period, config=config, out_root=out_root,
-                           users=users, exclude_bots=exclude_bots, separate_users=separate_users)
+                           users=users, exclude_bots=exclude_bots, separate_users=separate_users,
+                           attribution_mode=mode)
 
 
 def progress_text(step: Step, index: int, total: int) -> str:
@@ -465,6 +469,7 @@ def _init_state() -> None:
         "end_date": end, "end_time": None, "tz": DEFAULT_TIMEZONE,
         "identities_path": DEFAULT_IDENTITIES, "user_mode": USER_MODES[0], "user_query": "",
         "exclude_bots": False, "separate_users": False, "config_path": "",
+        "attribution_mode": ATTRIBUTION_MODES[0],
         "out_dir": DEFAULT_OUT_DIR, "repo": None, "loaded_with": None, "repo_gen": 0,
         "branches": [], "branch_value": None, "repo_error": None, "period_memo": {},
         "selected": set(), "run_requested": False, "run_error": None, "result": None,
@@ -531,11 +536,9 @@ def _render_period(locked: bool) -> tuple[Period | None, str | None, Any]:
     with left:
         st.date_input("Start", key="start_date", min_value=MIN_DATE, max_value=MAX_DATE,
                       format="YYYY-MM-DD", disabled=locked)
-        st.time_input("Giờ start (tùy chọn)", key="start_time", step=60, disabled=locked)
     with right:
         st.date_input("End", key="end_date", min_value=MIN_DATE, max_value=MAX_DATE,
                       format="YYYY-MM-DD", disabled=locked)
-        st.time_input("Giờ end (tùy chọn)", key="end_time", step=60, disabled=locked)
     tz_error = None
     if ss.tz not in timezone_options():  # không để selectbox âm thầm chọn mục đầu (A14)
         canonical = canonical_timezone(ss.tz)
@@ -545,17 +548,11 @@ def _render_period(locked: bool) -> tuple[Period | None, str | None, Any]:
             ss.tz = canonical
     if tz_error:
         st.error(tz_error)
-    else:
-        now = datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
-        st.selectbox("Múi giờ", timezone_options(), key="tz",
-                     format_func=lambda name: timezone_label(name, now), disabled=locked)
     placeholder = st.container()
     if tz_error:
         return None, tz_error, placeholder
-    start_time: time | None = ss.start_time
-    end_time: time | None = ss.end_time
-    try:
-        return make_period(ss.start_date, ss.end_date, start_time, end_time,
+    try:  # web UI chỉ chọn ngày: không nhập giờ (A17)
+        return make_period(ss.start_date, ss.end_date, None, None,
                            timezone=ss.tz), None, placeholder
     except LocCounterError as err:
         st.error(str(err))
@@ -635,6 +632,8 @@ def _render_users(locked: bool, ctx: PeriodContext | None, identity_map: Identit
         st.checkbox("Loại trừ bot", key="exclude_bots", disabled=locked)
     with right:
         st.checkbox("Xuất riêng từng user", key="separate_users", disabled=locked)
+    st.radio("Cách gán tác giả", ATTRIBUTION_MODES, key="attribution_mode", horizontal=True,
+             disabled=locked)
     if ctx is not None:
         for warning in ctx.users.warnings:
             st.warning(warning)
@@ -798,7 +797,8 @@ def _run_analysis(repo: GitRepo | None, token: str, ctx: PeriodContext | None,
                 request = build_request(branch=ctx.branch, period=ctx.period, config=config,
                                         out_root=out_root, user_mode=ss.user_mode,
                                         selected=ss.selected, exclude_bots=ss.exclude_bots,
-                                        separate_users=ss.separate_users)
+                                        separate_users=ss.separate_users,
+                                        attribution_mode=ss.attribution_mode)
                 try:
                     result = pipeline.run_analysis(repo, request, resolver,
                                                    progress=on_progress, context=ctx)
@@ -975,7 +975,7 @@ def main() -> None:
     st.button("PHÂN TÍCH", key="analyze", type="primary", on_click=_request_run,
               disabled=bool(blockers) or locked)
     sig = (ss.repo_gen, branch, period, identity_map, config, ss.out_dir, ss.user_mode,
-           tuple(sorted(ss.selected)), ss.exclude_bots, ss.separate_users)
+           tuple(sorted(ss.selected)), ss.exclude_bots, ss.separate_users, ss.attribution_mode)
     if ss.run_error:
         st.error(ss.run_error)
     if ss.result is not None:

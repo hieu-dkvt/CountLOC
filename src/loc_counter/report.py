@@ -45,6 +45,8 @@ LANGUAGE_CSV_NAME = "loc_by_language.csv"
 FILE_CSV_NAME = "loc_by_file.csv"
 WARNINGS_CSV_NAME = "warnings.csv"
 MANIFEST_NAME = "manifest.json"
+ATTRIBUTION_MODE_LABELS = {"line": "Theo từng dòng",
+                           "last_commit": "Theo commit cuối cùng của file"}
 SHEET_NAMES = ("Tong_quan", "Theo_ngon_ngu", "Theo_user", "Theo_file", "Theo_tuan", "Canh_bao")
 XLSX_MAX_CELL_CHARS = 32767
 
@@ -108,6 +110,7 @@ class ReportOptions:
     selected_users: tuple[str, ...] | None = None
     exclude_bots: bool = False
     separate_users: bool = False
+    attribution_mode: str = "line"
 
 
 @dataclass(frozen=True)
@@ -299,6 +302,8 @@ def _overview_sheet(ws: Worksheet, data: ReportData) -> None:
         ("C_END", data.c_end.sha, None),
         ("Snapshot end", _snapshot_text(data.c_end, period.timezone), None),
         ("User", user_text, None),
+        ("Cách gán tác giả", ATTRIBUTION_MODE_LABELS.get(data.options.attribution_mode,
+                                                         data.options.attribution_mode), None),
         ("Số user được tính", len(data.users), _INT),
         ("LOC start", data.loc_start, _INT),
         ("LOC end", data.loc_end, _INT),
@@ -483,6 +488,7 @@ def build_manifest(data: ReportData, generated_at: datetime | None = None) -> di
             "selected_users": list(selected) if selected is not None else None,
             "exclude_bots": data.options.exclude_bots,
             "separate_users": data.options.separate_users,
+            "attribution_mode": data.options.attribution_mode,
         },
         "exports": [_export_dict(e) for e in data.exports],
     }

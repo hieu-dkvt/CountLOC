@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
+import os
+import threading
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal
@@ -13,15 +17,17 @@ from loc_counter.classifier import LineClassifier
 from loc_counter.config import FilterConfig
 from loc_counter.counter import LocWarning, WarningKind, decode_text
 from loc_counter.filters import BINARY_SNIFF_BYTES, is_binary
-from loc_counter.git_repo import DiffEntry, GitRepo, Hunk, LogCommit
+from loc_counter.git_repo import BlameLine, DiffEntry, GitRepo, Hunk, LogCommit
 from loc_counter.identity import AccountResolver
 from loc_counter.snapshot import Snapshots, select_content
 
 logger = logging.getLogger(__name__)
 
-Granularity = Literal["lines", "whole", "skip"]
+Granularity = Literal["lines", "whole", "last", "skip"]
+AttributionMode = Literal["line", "last_commit"]
 
 MAX_MERGE_DEPTH = 64
+ATTRIBUTION_WORKERS = min(8, os.cpu_count() or 1)
 
 _SPECIAL_MODES = ("120000", "160000")
 _WHITESPACE = b" \t\n\v\f\r"
@@ -178,8 +184,10 @@ class _Attributor:
 
     def __init__(self, repo: GitRepo, cs: str | None, ce: str,
                  by_sha: Mapping[str, LogCommit], accounts: Mapping[str, str],
-                 filters: FilterConfig, blobs: Mapping[str, bytes]) -> None:
+                 filters: FilterConfig, blobs: Mapping[str, bytes],
+                 mode: AttributionMode = "line") -> None:
         self.repo = repo
+        self.mode = mode
         self.cs = cs
         self.ce = ce
         self.by_sha = by_sha
@@ -187,6 +195,13 @@ class _Attributor:
         self.filters = filters
         self.blobs = blobs
         self._memo: dict[tuple[str, str, int, str], str] = {}
+        # cờ "chạm MAX_MERGE_DEPTH" của chuỗi đệ quy đang chạy trên luồng này (A16)
+        self._truncation = threading.local()
+        # bộ nhớ đệm truy vấn git (5.6a): sống trong một lần attribute_period
+        self._anc_cache: dict[tuple[str, str], bool] = {}
+        self._bases_cache: dict[tuple[str, str], list[str]] = {}
+        self._fca_cache: dict[tuple[str, str, tuple[str, ...]], str | None] = {}
+        self._blame_cache: dict[tuple[str, str, str, int, bool], BlameLine] = {}
 
     # ----- thông tin từng phía (5.2) -----
     def side(self, path: str | None, mode: str | None, sha: str | None) -> SideInfo | None:
@@ -206,6 +221,76 @@ class _Attributor:
         commit = self.by_sha.get(sha)
         return commit is not None and commit.is_merge
 
+    # ----- truy vấn git có bộ nhớ đệm (5.6a); lỗi git không được ghi nhớ -----
+    def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """repo.is_ancestor có bộ nhớ đệm theo cặp commit."""
+        key = (ancestor, descendant)
+        cache = self._anc_cache
+        if key in cache:
+            return cache[key]
+        value = self.repo.is_ancestor(ancestor, descendant)
+        cache[key] = value
+        return value
+
+    def _merge_bases(self, a: str, b: str) -> list[str]:
+        """repo.merge_bases có bộ nhớ đệm theo cặp commit."""
+        key = (a, b)
+        cache = self._bases_cache
+        if key in cache:
+            return cache[key]
+        value = self.repo.merge_bases(a, b)
+        cache[key] = value
+        return value
+
+    def _first_after(self, since: str, until: str, paths: Sequence[str]) -> str | None:
+        """repo.first_commit_after có bộ nhớ đệm theo (since, until, paths)."""
+        key = (since, until, tuple(paths))
+        cache = self._fca_cache
+        if key in cache:
+            return cache[key]
+        value = self.repo.first_commit_after(since, until, paths)
+        cache[key] = value
+        return value
+
+    def _line_blame(self, end: str, path: str, since: str, line: int, *,
+                    reverse: bool) -> BlameLine:
+        """Blame một dòng của D23 (xuôi không -M -C, hoặc ngược); dùng kết quả đã nạp nếu có."""
+        cache = self._blame_cache
+        key = (end, path, since, line, reverse)
+        if key in cache:
+            return cache[key]
+        if reverse:
+            found = self.repo.blame(end, path, since, reverse=True, line_ranges=[(line, line + 1)])
+        else:
+            found = self.repo.blame(end, path, since, detect_moves=False,
+                                    line_ranges=[(line, line + 1)])
+        cache[key] = found[0]
+        return found[0]
+
+    def _fill_blame(self, end: str, path: str, since: str, lines: Iterable[int], *,
+                    reverse: bool) -> dict[int, BlameLine]:
+        """Một lệnh blame nhiều -L cho các dòng chưa có trong bộ nhớ đệm; trả dòng → kết quả."""
+        cache = self._blame_cache
+        result: dict[int, BlameLine] = {}
+        todo: list[int] = []
+        for i in sorted(set(lines)):
+            hit = cache.get((end, path, since, i, reverse))
+            if hit is None:
+                todo.append(i)
+            else:
+                result[i] = hit
+        if todo:
+            ranges = [(i, i + 1) for i in todo]
+            if reverse:
+                fetched = self.repo.blame(end, path, since, reverse=True, line_ranges=ranges)
+            else:
+                fetched = self.repo.blame(end, path, since, detect_moves=False,
+                                          line_ranges=ranges)
+            for b in fetched:
+                cache[(end, path, since, b.line, reverse)] = b
+                result[b.line] = b
+        return result
+
     # ----- merge (5.6, D23) -----
     def resolve_merge(self, anchor: tuple[str, str, int], merge: str, depth: int) -> str:
         """Commit xóa dòng anchor bên các parent của merge; _UNDETERMINED nếu không xác định."""
@@ -213,48 +298,112 @@ class _Attributor:
         memo_key = (s, path, j, merge)
         if memo_key in self._memo:
             return self._memo[memo_key]
+        state = self._truncation
         if depth > MAX_MERGE_DEPTH:
             logger.warning("Vượt giới hạn đệ quy merge (%d) cho %s dòng %d", MAX_MERGE_DEPTH,
                            path, j + 1)
+            state.hit = True
             return _UNDETERMINED
-        result = merge
-        for parent in self.by_sha[merge].parents:
-            side = self._parent_side(anchor, parent, depth)
-            if side != _PRESENT:
-                result = side
-                break
-        self._memo[memo_key] = result
-        return result
+        outer = getattr(state, "hit", False)
+        state.hit = False
+        try:
+            result = merge
+            for parent in self.by_sha[merge].parents:
+                side = self._parent_side(anchor, parent, depth)
+                if side != _PRESENT:
+                    result = side
+                    break
+            if not state.hit:  # kết quả chạm giới hạn độ sâu phụ thuộc độ sâu → không ghi nhớ
+                self._memo[memo_key] = result
+            return result
+        finally:
+            state.hit = outer or state.hit
 
     def _parent_side(self, anchor: tuple[str, str, int], parent: str, depth: int) -> str:
         """Kết quả bên một parent của merge: _PRESENT, _UNDETERMINED hoặc commit xóa."""
+        found = self._locate(anchor, parent)
+        if isinstance(found, str):
+            return found
+        return self.resolve_merge(found[0], found[1], depth + 1)
+
+    def _locate(self, anchor: tuple[str, str, int], parent: str
+                ) -> str | tuple[tuple[str, str, int], str]:
+        """Các bước 5.6.2 cho một parent, dừng trước khi đệ quy.
+
+        Trả _PRESENT / _UNDETERMINED / commit xóa, hoặc (neo mới, merge) khi ứng viên là merge.
+        """
         s, path, j = anchor
-        repo = self.repo
-        if repo.is_ancestor(s, parent):
+        if self._is_ancestor(s, parent):
             neo = anchor
         else:
-            bases = repo.merge_bases(s, parent)
+            bases = self._merge_bases(s, parent)
             if len(bases) != 1:
                 return _UNDETERMINED
-            fb = repo.blame(s, path, bases[0], detect_moves=False, line_ranges=[(j, j + 1)])[0]
+            fb = self._line_blame(s, path, bases[0], j, reverse=False)
             if not fb.boundary:
                 return _PRESENT  # dòng sinh sau base, phía parent chưa từng có
-            if not repo.is_ancestor(fb.sha, parent):
+            if not self._is_ancestor(fb.sha, parent):
                 return _UNDETERMINED
             neo = (fb.sha, fb.filename, fb.orig_line)
         neo_commit, neo_path, neo_line = neo
         if neo_commit == parent:
             return _PRESENT
-        r = repo.blame(parent, neo_path, neo_commit, reverse=True,
-                       line_ranges=[(neo_line, neo_line + 1)])[0]
+        r = self._line_blame(parent, neo_path, neo_commit, neo_line, reverse=True)
         if r.sha == parent:
             return _PRESENT
-        c = repo.first_commit_after(r.sha, parent, [r.filename])
+        c = self._first_after(r.sha, parent, [r.filename])
         if c is None:
             return _UNDETERMINED
         if self._is_merge(c):
-            return self.resolve_merge((r.sha, r.filename, r.orig_line), c, depth + 1)
+            return (r.sha, r.filename, r.orig_line), c
         return c
+
+    def _warm_merge(self, groups: Mapping[tuple[str, str, str], Sequence[int]],
+                    depth: int) -> None:
+        """Nạp bộ nhớ đệm blame cho các dòng cùng (S, path, M), từng tầng đệ quy (5.6a).
+
+        Chỉ nạp cache: kết quả vẫn do resolve_merge từng dòng tính. Duyệt parent theo thứ tự
+        và chỉ blame cho parent mà cách tính tuần tự cũng sẽ tới; dòng hội tụ về cùng
+        (S, path, M) ở tầng sau dùng chung một lệnh blame.
+        """
+        if depth > MAX_MERGE_DEPTH or not groups:
+            return
+        nested: dict[tuple[str, str, str], list[int]] = {}
+        for (s, path, merge), lines in groups.items():
+            pending = {j: (s, path, j) for j in dict.fromkeys(lines)
+                       if (s, path, j, merge) not in self._memo}
+            for parent in self.by_sha[merge].parents:
+                if not pending:
+                    break
+                self._warm_parent(s, path, list(pending), parent)
+                for j, anchor in list(pending.items()):
+                    found = self._locate(anchor, parent)
+                    if found == _PRESENT:
+                        continue
+                    del pending[j]
+                    if not isinstance(found, str):
+                        (rs, rpath, rline), c = found
+                        nested.setdefault((rs, rpath, c), []).append(rline)
+        self._warm_merge(nested, depth + 1)
+
+    def _warm_parent(self, s: str, path: str, lines: Sequence[int], parent: str) -> None:
+        """Gom blame xuôi (tới merge-base) và blame ngược (trên parent) của 5.6.2 cho các dòng."""
+        neos: dict[tuple[str, str], list[int]] = {}
+        if self._is_ancestor(s, parent):
+            neos[(s, path)] = list(lines)
+        else:
+            bases = self._merge_bases(s, parent)
+            if len(bases) != 1:
+                return
+            forward = self._fill_blame(s, path, bases[0], lines, reverse=False)
+            for j in lines:
+                fb = forward.get(j)
+                if fb is None or not fb.boundary or not self._is_ancestor(fb.sha, parent):
+                    continue
+                neos.setdefault((fb.sha, fb.filename), []).append(fb.orig_line)
+        for (neo_commit, neo_path), neo_lines in neos.items():
+            if neo_commit != parent:
+                self._fill_blame(parent, neo_path, neo_commit, neo_lines, reverse=True)
 
     # ----- một cặp file -----
     def attribute_file(self, entry: DiffEntry) -> tuple[FileAttribution, list[LocWarning]]:
@@ -268,6 +417,9 @@ class _Attributor:
         if not any(s.keep for s in present):
             return FileAttribution(entry, old, new, "skip", (), _EMPTY, _EMPTY, frozenset(), None,
                                    None), warnings
+
+        if self.mode == "last_commit":
+            return self._attribute_last(entry, old, new, present, warnings)
 
         renamed_by = self._renamed_by(entry, warnings) if entry.status == "R" else None
 
@@ -309,6 +461,34 @@ class _Attributor:
                                MappingProxyType(added_by), MappingProxyType(deleted_by),
                                frozenset(moved), renamed_by, None, MappingProxyType(added),
                                MappingProxyType(deleted)), warnings
+
+    def _attribute_last(self, entry: DiffEntry, old: SideInfo | None, new: SideInfo | None,
+                        present: Sequence[SideInfo], warnings: list[LocWarning]
+                        ) -> tuple[FileAttribution, list[LocWarning]]:
+        """Mode last_commit (5.10): mọi dòng thêm / xóa của file thuộc người sửa cuối cùng."""
+        paths = list(dict.fromkeys(p for p in (entry.old_path, entry.new_path) if p))
+        touched = self.repo.rev_list(self.ce, self.cs, paths)
+        last = touched[0] if touched else None
+        account = self.accounts.get(last) if last else None
+        if account is None:
+            last = None
+            warnings.append(LocWarning(WarningKind.UNATTRIBUTED, entry.path,
+                                       "Không xác định được người thay đổi cuối của file"))
+        renamed_by = account if entry.status == "R" else None
+        plain = account is not None and all(
+            s.mode not in _SPECIAL_MODES and not s.binary and not s.too_large for s in present)
+        if not plain or last is None:
+            return FileAttribution(entry, old, new, "last", (), _EMPTY, _EMPTY, frozenset(),
+                                   renamed_by, account), warnings
+        hunks = self._hunks(old, new)
+        added = {i: last for h in hunks for i in range(h.new_start, h.new_start + h.new_count)}
+        deleted = ({i: last for h in hunks for i in range(h.old_start, h.old_start + h.old_count)}
+                   if self.cs is not None else {})
+        return FileAttribution(
+            entry, old, new, "last", tuple(hunks),
+            MappingProxyType({i: self.accounts[s] for i, s in added.items()}),
+            MappingProxyType({i: self.accounts[s] for i, s in deleted.items()}), frozenset(),
+            renamed_by, account, MappingProxyType(added), MappingProxyType(deleted)), warnings
 
     def _hunks(self, old: SideInfo | None, new: SideInfo | None) -> list[Hunk]:
         """Hunk theo 5.3 (D24)."""
@@ -371,8 +551,15 @@ class _Attributor:
                 alive.add(b.line)
             else:
                 groups.setdefault((b.sha, b.filename), []).append((b.line, b.orig_line))
+        cands = {key: self._first_after(key[0], self.ce, [key[1]]) for key in groups}
+        merge_groups: dict[tuple[str, str, str], list[int]] = {}
         for (last, filename), lines in groups.items():
-            cand = self.repo.first_commit_after(last, self.ce, [filename])
+            cand = cands[(last, filename)]
+            if cand is not None and self._is_merge(cand):
+                merge_groups[(last, filename, cand)] = [orig for _, orig in lines]
+        self._warm_merge(merge_groups, 1)
+        for (last, filename), lines in groups.items():
+            cand = cands[(last, filename)]
             for line, orig_line in lines:
                 deleter = cand
                 if cand is not None and self._is_merge(cand):
@@ -516,7 +703,7 @@ def _line_stats(files: Sequence[FileAttribution], accounts: Mapping[str, str],
             touched[account].add(f.path)
 
     for f in files:
-        if f.granularity == "lines":
+        if f.granularity in ("lines", "last"):
             new_flags = (_code_flags(f.new, blobs[f.new.sha], classifier)
                          if f.new is not None and f.added_commit else None)
             count(f, f.added_commit, new_flags, 0)
@@ -533,10 +720,34 @@ def _line_stats(files: Sequence[FileAttribution], accounts: Mapping[str, str],
     return users, commit_stats
 
 
+def _attribute_entries(attributor: _Attributor, entries: Sequence[DiffEntry]
+                       ) -> list[tuple[FileAttribution, list[LocWarning]]]:
+    """attribute_file mọi entry, song song theo file; kết quả và lỗi theo thứ tự entries (5.1a)."""
+    workers = min(ATTRIBUTION_WORKERS, len(entries))
+    if workers <= 1:
+        return [attributor.attribute_file(e) for e in entries]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="loc-attr") as pool:
+        # mỗi task một bản sao context của luồng gọi: run.log của pipeline nhận log luồng con
+        futures = [pool.submit(contextvars.copy_context().run, attributor.attribute_file, e)
+                   for e in entries]
+        try:
+            return [f.result() for f in futures]
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
+
+
 def attribute_period(repo: GitRepo, snapshots: Snapshots, commits: Sequence[LogCommit],
                      resolver: AccountResolver, filters: FilterConfig,
-                     classifier: LineClassifier | None = None) -> PeriodAttribution:
-    """Gán tác giả cho mọi dòng trong hunk giữa C_START và C_END (§7.2, D22–D31)."""
+                     classifier: LineClassifier | None = None,
+                     mode: AttributionMode = "line") -> PeriodAttribution:
+    """Gán tác giả cho mọi dòng trong hunk giữa C_START và C_END (§7.2, D22–D31).
+
+    mode "last_commit": gán theo người sửa cuối cùng của từng file (5.10).
+    """
+    if mode not in ("line", "last_commit"):
+        raise ValueError(f"mode không hợp lệ: {mode!r}")
     if classifier is None:
         classifier = LineClassifier(filters.count_docstrings)
     cs = snapshots.c_start.sha if snapshots.c_start else None
@@ -554,16 +765,15 @@ def attribute_period(repo: GitRepo, snapshots: Snapshots, commits: Sequence[LogC
 
     shas: list[str] = []
     for e in tree_diff.entries:
-        for mode, sha in ((e.old_mode, e.old_sha), (e.new_mode, e.new_sha)):
-            if sha is not None and mode not in _SPECIAL_MODES:
+        for file_mode, sha in ((e.old_mode, e.old_sha), (e.new_mode, e.new_sha)):
+            if sha is not None and file_mode not in _SPECIAL_MODES:
                 shas.append(sha)
     shas = list(dict.fromkeys(shas))
     blobs = dict(repo.read_blobs(shas)) if shas else {}
 
-    attributor = _Attributor(repo, cs, ce, by_sha, accounts, filters, blobs)
+    attributor = _Attributor(repo, cs, ce, by_sha, accounts, filters, blobs, mode)
     files: list[FileAttribution] = []
-    for entry in tree_diff.entries:
-        file_attr, file_warnings = attributor.attribute_file(entry)
+    for file_attr, file_warnings in _attribute_entries(attributor, tree_diff.entries):
         files.append(file_attr)
         warnings.extend(file_warnings)
 

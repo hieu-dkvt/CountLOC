@@ -168,6 +168,7 @@ def test_overview_sheet(tmp_path: Path) -> None:
         ("C_END", "f" * 40),
         ("Snapshot end", 'fffffff (2026-01-21 10:05) "Release 2.3"'),
         ("User", "alice, bob"),
+        ("Cách gán tác giả", "Theo từng dòng"),
         ("Số user được tính", 2),
         ("LOC start", 10),
         ("LOC end", 20),
@@ -190,8 +191,8 @@ def test_overview_sheet(tmp_path: Path) -> None:
         ("end_2026-01-31_bob.zip", "End (riêng)", "bob", 2, 16, 17, 6.25, "Lệch quá ngưỡng"),
     ]
     assert got == expected_head
-    assert isinstance(ws["B13"].value, int)
-    assert ws["A1"].font.b and ws["A26"].font.b
+    assert isinstance(ws["B14"].value, int)
+    assert ws["A1"].font.b and ws["A27"].font.b
 
 
 def test_language_sheet(tmp_path: Path) -> None:
@@ -453,7 +454,7 @@ def test_build_manifest() -> None:
     assert m["cross_check"] == {"expected_loc_end": 20, "diff_percent": 0.0, "loc_end": 20,
                                 "sum_net_code": 10, "threshold_percent": 0.5, "ok": True}
     assert m["options"] == {"selected_users": ["alice", "bob"], "exclude_bots": False,
-                            "separate_users": True}
+                            "separate_users": True, "attribution_mode": "line"}
     json.dumps(m)
 
 

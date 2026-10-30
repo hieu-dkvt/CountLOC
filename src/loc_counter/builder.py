@@ -263,7 +263,7 @@ def _build_file(fa: FileAttribution, users: frozenset[str], filters: FilterConfi
         sel = select_content(side.path, side.mode, blobs[side.sha], filters)
         return None, list(sel.warnings)
 
-    if fa.granularity == "whole":
+    if fa.granularity in ("whole", "last"):
         side = new if fa.last_touch_by in users else old
         if not _is_blob(side):
             return None, []

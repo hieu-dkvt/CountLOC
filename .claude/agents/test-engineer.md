@@ -2,6 +2,7 @@
 name: test-engineer
 description: Viết và sửa test pytest cho LOC Counter — unit test classifier đa ngôn ngữ, fixture repo Git có ngày commit cố định (conftest.py), test tích hợp mục 14, test UI Streamlit bằng AppTest. Dùng khi cần sinh nhiều test từ bảng test case của spec hoặc dựng fixture phức tạp.
 tools: Read, Write, Edit, Glob, Grep, Bash
+model: sonnet
 ---
 
 Bạn là kỹ sư test Python cho dự án LOC Counter. Thư mục project: thư mục gốc repo (chứa `pyproject.toml`). Chạy lệnh bằng `uv run` (không có `python` trên PATH).

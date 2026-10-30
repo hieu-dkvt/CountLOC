@@ -1009,3 +1009,197 @@ def test_make_resolver(tmp_path: Path) -> None:
     assert r.identities is IDS
     assert make_resolver("https://github.com/org/repo", None, None).github is None
     assert make_resolver(str(tmp_path), None, TOKEN).github is None
+
+
+# ---------- TC-38, 39: dùng lại kết quả gán tác giả, log luồng con (A21, A22) ----------
+def test_attribution_memo(s14, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-pipeline-38: cùng ctx + filters + resolver → không gán tác giả lại; khác → tính lại."""
+    _, repo = s14()
+    resolver = AccountResolver(IDS)
+    ctx = prepare_period(repo, "main", jan(), resolver)
+    calls: list[FilterConfig] = []
+    real = pipeline.attribute_period
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(args[4])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "attribute_period", spy)
+    analyze(repo, tmp_path / "o1", resolver=resolver, context=ctx)
+    assert len(calls) == 1
+    r2 = analyze(repo, tmp_path / "o2", ("alice",), resolver=resolver, context=ctx)
+    assert len(calls) == 1
+    log2 = (tmp_path / "o2" / "run.log").read_text(encoding="utf-8")
+    assert "Dùng lại kết quả gán tác giả đã tính cho kỳ này" in log2
+
+    fresh_resolver = AccountResolver(IDS)
+    fresh = prepare_period(repo, "main", jan(), fresh_resolver)
+    r2b = analyze(repo, tmp_path / "o2b", ("alice",), resolver=fresh_resolver, context=fresh)
+    assert len(calls) == 2
+    assert digests(r2.out_dir) == digests(r2b.out_dir)  # cùng now → trùng cả manifest
+    assert r2.data == r2b.data
+
+    docstrings = AppConfig(FilterConfig(count_docstrings=True))
+    analyze(repo, tmp_path / "o3", resolver=resolver, context=ctx, config=docstrings)
+    assert len(calls) == 3 and calls[-1].count_docstrings
+    analyze(repo, tmp_path / "o4", resolver=AccountResolver(IDS), context=ctx, config=docstrings)
+    assert len(calls) == 4
+    assert len(ctx.attribution_memo) == 1
+    for name in ("o1", "o3", "o4"):
+        text = (tmp_path / name / "run.log").read_text(encoding="utf-8")
+        assert "Dùng lại kết quả gán tác giả" not in text
+
+    plain = PeriodContext(ctx.branch, ctx.period, ctx.snapshots, ctx.commits, ctx.users)
+    assert plain == ctx
+    assert plain.attribution_memo == {}
+    assert dataclasses.replace(ctx).attribution_memo == {}  # replace không chia sẻ memo
+
+    # memo chỉ giữ weakref: resolver bị thu hồi thì không còn được giữ (không giữ token)
+    import gc
+    import weakref
+
+    temp = AccountResolver(IDS)
+    analyze(repo, tmp_path / "o5", resolver=temp, context=ctx, config=docstrings)
+    assert len(calls) == 5
+    probe = weakref.ref(temp)
+    del temp
+    gc.collect()
+    assert probe() is None
+
+
+def _warn_in_pool(message: str) -> None:
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+
+    log = logging.getLogger("loc_counter.test")
+    with ThreadPoolExecutor(2) as pool:
+        pool.submit(contextvars.copy_context().run, log.warning, message).result()
+
+
+def test_run_log_worker_threads(tmp_path: Path) -> None:
+    """TC-pipeline-39: (a) luồng con có context vào run.log; (b) Thread thường thì không; (d)."""
+    with run_log(tmp_path / "x"):
+        _warn_in_pool("con có context")
+        other = threading.Thread(target=logging.getLogger("loc_counter.test").warning,
+                                 args=("luồng thường",))
+        other.start()
+        other.join()
+    text = (tmp_path / "x" / "run.log").read_text(encoding="utf-8")
+    assert "con có context" in text
+    assert "luồng thường" not in text
+    assert pipeline._RUN_LOG_ID.get(None) is None
+
+    a_in, b_in, a_done = threading.Event(), threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+    after: list[str | None] = []
+
+    def session(name: str, mine: threading.Event, theirs: threading.Event) -> None:
+        try:
+            with run_log(tmp_path / name):
+                mine.set()
+                assert theirs.wait(10)
+                _warn_in_pool(f"từ phiên {name}")
+                if name == "a":
+                    a_done.set()
+                else:
+                    assert a_done.wait(10)
+            after.append(pipeline._RUN_LOG_ID.get(None))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=session, args=("a", a_in, b_in)),
+               threading.Thread(target=session, args=("b", b_in, a_in))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert errors == []
+    assert after == [None, None]
+    log_a = (tmp_path / "a" / "run.log").read_text(encoding="utf-8")
+    log_b = (tmp_path / "b" / "run.log").read_text(encoding="utf-8")
+    assert "từ phiên a" in log_a and "từ phiên b" not in log_a
+    assert "từ phiên b" in log_b and "từ phiên a" not in log_b
+
+
+def test_run_log_exit_other_context(tmp_path: Path) -> None:
+    """TC-pipeline-39: (e) vào with ở một context, thoát ở context khác → vẫn dọn sạch."""
+    import contextvars
+
+    pkg = logging.getLogger("loc_counter")
+    old_level = pkg.level
+    cm = run_log(tmp_path / "e")
+    contextvars.copy_context().run(cm.__enter__)
+    cm.__exit__(None, None, None)  # reset token ở context khác: không được làm sót dọn dẹp
+    assert not [h for h in pkg.handlers if isinstance(h, logging.FileHandler)]
+    assert pkg.level == old_level
+    assert pipeline._level_sessions == 0
+    (tmp_path / "e" / "run.log").unlink()  # Windows: handler đã đóng nên xóa được
+
+
+def test_run_log_attribution_workers(make_repo, cache_root: Path, tmp_path: Path,
+                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-pipeline-39: (c) WARNING phát trong luồng gán tác giả song song có trong run.log."""
+    from test_attribution import build_merge_parallel, prepare
+
+    from loc_counter import attribution
+
+    src = make_repo()
+    build_merge_parallel(src)
+    src.commit("alice extra", "2026-01-08T10:00:00+07:00", author=ALICE,
+               files={"extra.py": "x = 1\n"})
+    ctx = prepare(src, cache_root)
+    monkeypatch.setattr(attribution, "MAX_MERGE_DEPTH", 0)
+    monkeypatch.setattr(attribution, "ATTRIBUTION_WORKERS", 4)
+    seen: list[str] = []
+    real = ctx.repo.blame
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(threading.current_thread().name)
+        return real(*args, **kwargs)
+
+    ctx.repo.blame = spy  # type: ignore[method-assign]
+    with run_log(tmp_path / "out"):
+        ctx.attribute()
+    text = (tmp_path / "out" / "run.log").read_text(encoding="utf-8")
+    assert "Vượt giới hạn đệ quy merge" in text
+    assert any(name.startswith("loc-attr") for name in seen)
+
+
+# ---------- TC-40: chế độ gán tác giả last_commit ----------
+def test_attribution_mode_last_commit(s14, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-pipeline-40: last_commit — tất cả 10/20; alice 10/10; bob 10/20; memo theo chế độ."""
+    _, repo = s14()
+
+    def run(out: str, users: tuple[str, ...] | None, mode: str,
+            ctx: PeriodContext | None = None) -> AnalysisResult:
+        request = AnalysisRequest("main", jan(), AppConfig(), tmp_path / out, users,
+                                  attribution_mode=mode)  # type: ignore[arg-type]
+        resolver = AccountResolver(IDS)
+        with run_log(tmp_path / out):
+            return run_analysis(repo, request, resolver, context=ctx, now=lambda: NOW)
+
+    r = run("all", None, "last_commit")
+    assert (r.data.loc_start, r.data.loc_end) == (10, 20)
+    assert r.data.cross_check.diff_percent == 0 and not warnings_of(r, WarningKind.CROSS_CHECK)
+    assert r.data.options.attribution_mode == "last_commit"
+    assert manifest_of(r.out_dir)["options"]["attribution_mode"] == "last_commit"
+    rows = rows_of(r)
+    assert (rows["alice"].added_code, rows["alice"].deleted_code) == (0, 0)
+    assert (rows["bob"].added_code, rows["bob"].deleted_code) == (13, 3)
+    assert (run("a", ("alice",), "last_commit").data.loc_end,
+            run("b", ("bob",), "last_commit").data.loc_end) == (10, 20)
+    assert manifest_of(run("c", None, "line").out_dir)["options"]["attribution_mode"] == "line"
+
+    ctx = prepare_period(repo, "main", jan(), AccountResolver(IDS))
+    spy = Spy(monkeypatch, pipeline, "attribute_period")
+    resolver = AccountResolver(IDS)
+    request = AnalysisRequest("main", jan(), AppConfig(), tmp_path / "m")
+    with run_log(tmp_path / "m"):
+        run_analysis(repo, request, resolver, context=ctx, now=lambda: NOW)
+        run_analysis(repo, request, resolver, context=ctx, now=lambda: NOW)
+        assert len(spy.calls) == 1
+        last = dataclasses.replace(request, attribution_mode="last_commit")
+        run_analysis(repo, last, resolver, context=ctx, now=lambda: NOW)
+    assert len(spy.calls) == 2 and spy.calls[1][1]["mode"] == "last_commit"
+    with pytest.raises(ValueError, match="attribution_mode"):
+        run("bad", None, "x")

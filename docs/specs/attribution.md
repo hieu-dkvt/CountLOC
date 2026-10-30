@@ -7,7 +7,7 @@ modules: [src/loc_counter/attribution.py]
 tests: [tests/test_attribution.py]
 spec_refs: ["3.1", "3.3", "3.4", "3.5", "7.1", "7.2", "7.3", "7.4", "7.5", "8.2", "9", "10.3", "12", "14", "15", "16"]
 depends_on: [git_repo, identity, classifier, counter, snapshot]
-status: reviewed
+status: implemented
 ---
 
 # Gán tác giả dòng thêm / xóa trong kỳ
@@ -38,10 +38,14 @@ Ngoài phạm vi: dựng nội dung file và quy tắc cấp file §7.4 (`builde
 | R16 | Merge commit: dòng do giải quyết xung đột gán cho author merge; squash merge = commit thường | §16 |
 | R17 | (M5) Mỗi dòng thêm / xóa đã gán lưu sha commit thêm / xóa nó, ở mọi bước gán (blame xuôi, blame lần 2 D22, reverse blame + `first_commit_after`, D23, D28 (a)(b)); account của dòng = account của commit đó | §10.3, §12, PLAN D35 (Q40) |
 | R18 | (M5) Thống kê dòng / dòng code theo commit (`commit_stats`), cùng cờ code với thống kê theo user; Σ theo account = `UserLineStats` | §8.2, §10.3, §12, PLAN D35, spec `counter` A8 |
+| R19 | (Hiệu năng) Bước D23 (R8) không gọi lại git cho cùng một truy vấn và không chạy một lệnh blame cho từng dòng: ghi nhớ `is_ancestor` / `merge_bases` / `first_commit_after` / blame một dòng; gom blame nhiều dòng của cùng nhóm vào một lệnh nhiều `-L`. **Kết quả (account, sha, cảnh báo, thứ tự) giống hệt bản không tối ưu** | §15 (hiệu năng, tái lập), 5.6a |
+| R20 | (Hiệu năng) Gán tác giả các cặp file **song song** (thread), kết quả ghép theo thứ tự `diff_tree` — giống hệt chạy tuần tự; log của luồng con vẫn vào `run.log` của phiên | §15, 5.1a |
+| R21 | (Chế độ `last_commit`) Tham số `mode`: `"line"` (mặc định, R1–R20 như cũ) hoặc `"last_commit"` — mọi dòng thêm / xóa của một cặp file gán cho **một** account: author của commit cuối cùng chạm file trong kỳ. Không blame, không D22 / D23 / D28 | Yêu cầu người dùng 2026-10-30, mục 5.10, A17 |
 
 ## 3. Giao diện
 ```python
-Granularity = Literal["lines", "whole", "skip"]
+Granularity = Literal["lines", "whole", "last", "skip"]   # "last": chỉ ở mode last_commit (5.10)
+AttributionMode = Literal["line", "last_commit"]
 
 @dataclass(frozen=True)
 class SideInfo:
@@ -109,10 +113,12 @@ class PeriodAttribution:
     def commit(self, sha: str) -> CommitLineStats | None: ...   # (M5) None: commit không có dòng nào
 
 MAX_MERGE_DEPTH = 64
+ATTRIBUTION_WORKERS = min(8, os.cpu_count() or 1)   # số luồng gán tác giả (5.1a)
 
 def attribute_period(repo: GitRepo, snapshots: Snapshots, commits: Sequence[LogCommit],
                      resolver: AccountResolver, filters: FilterConfig,
-                     classifier: LineClassifier | None = None) -> PeriodAttribution:
+                     classifier: LineClassifier | None = None,
+                     mode: AttributionMode = "line") -> PeriodAttribution:
     """Gán tác giả cho mọi dòng trong hunk giữa C_START và C_END (§7.2, D22–D31)."""
 
 def count_lines(data: bytes) -> int:
@@ -135,6 +141,24 @@ Ký hiệu: `cs = snapshots.c_start.sha` hoặc None, `ce = snapshots.c_end.sha`
 1. `by_sha = {c.sha: c for c in commits}`; `commit_accounts = {sha: resolver.resolve(c)}`. `account(sha)` = `commit_accounts.get(sha)` (None = không thuộc kỳ).
 2. `td = repo.diff_tree(cs, ce)`. `td.rename_limit_hit` → cảnh báo `RENAME_LIMIT` path `""`: `Git bỏ qua nhận diện đổi tên do quá nhiều file; file đổi tên có thể bị tính là xóa + thêm`.
 3. Đọc nội dung mọi phía blob (mode ≠ `120000`, `160000`) bằng **một** lượt `repo.read_blobs` (SHA bỏ trùng, theo thứ tự xuất hiện); giữ trong `dict sha → bytes` cho tới hết hàm.
+
+### 5.1a Song song theo file (R20, A14, A15)
+4. `workers = min(ATTRIBUTION_WORKERS, len(td.entries))`. `workers ≤ 1` → gọi `attribute_file(entry)` tuần tự như cũ. Ngược lại dùng `ThreadPoolExecutor(max_workers=workers, thread_name_prefix="loc-attr")`: nộp **mọi** entry theo thứ tự `td.entries`, mỗi task chạy trong **bản sao context của luồng gọi** (`contextvars.copy_context().run`, tạo riêng cho từng task) để bộ lọc `run.log` của pipeline nhận log của luồng con (spec `pipeline` 5.5, A22).
+5. Lấy kết quả theo **đúng thứ tự nộp** (`future.result()` lần lượt) → `files` và cảnh báo phát theo thứ tự `td.entries` như chạy tuần tự. Một task ném lỗi (vd. `GitError`) → hủy các task chưa chạy, chờ task đang chạy xong, ném lỗi của **entry đầu tiên theo thứ tự** bị lỗi (cùng lỗi mà bản tuần tự sẽ gặp đầu tiên).
+6. `_Attributor` dùng chung giữa các luồng: blob (chỉ đọc), memo `resolve_merge` và các bộ nhớ đệm 5.6a là `dict` (thao tác đơn lẻ an toàn với GIL). Hai luồng có thể cùng tính một khóa → chạy git trùng nhưng kết quả như nhau (truy vấn thuần), không ảnh hưởng kết quả. Không thêm khóa (lock).
+7. `_line_stats` (5.9) chạy tuần tự sau khi có đủ kết quả.
+
+### 5.10 Chế độ `mode="last_commit"` (R21, A17)
+Mục đích: thuật toán đơn giản — người sửa **cuối cùng** của file được tính toàn bộ thay đổi của file trong kỳ. `mode="line"` không đổi gì so với các mục khác.
+Với mỗi `entry` (5.1 bước 1–3 giữ nguyên, kể cả `RENAME_LIMIT`), sau 5.2:
+1. Không có phía `keep` → `granularity="skip"` như cũ.
+2. Ngược lại `granularity="last"` — kể cả binary / quá lớn / `T` / symlink-gitlink (ở mode `line` các file này là `"whole"`; `"last"` thay `"whole"` ở mode này). `touched = repo.rev_list(ce, cs, paths)` với `paths` = `[old_path, new_path]` bỏ None, bỏ trùng; `last = touched[0]` (mới nhất theo topo, như `"whole"`). `last_touch_by = account(last)`; `touched` rỗng hoặc `last` ngoài `commit_accounts` → `last_touch_by=None` + cảnh báo `UNATTRIBUTED` path `entry.path`: `Không xác định được người thay đổi cuối của file` (như `"whole"`).
+3. `renamed_by = last_touch_by` khi `entry.status == "R"` (người sửa cuối quyết định cả tên: builder chọn tên mới khi `last_touch_by` ∈ users); không gọi `_renamed_by`, không cảnh báo `RENAME_UNRESOLVED`.
+4. Dòng — chỉ khi `last_touch_by` khác None và các phía có mặt đều là blob text (không symlink / gitlink, không binary, không quá lớn): `hunks` như 5.3. Mọi dòng mới trong hunk → `added_by[i] = last_touch_by`, `added_commit[i] = last`; mọi dòng cũ trong hunk → `deleted_by[j] = last_touch_by`, `deleted_commit[j] = last` (phía cũ chỉ khi `cs` khác None). Không `moved`, không D22 / D28, không cảnh báo `MOVED_LINES` / `MULTI_USER_HUNK` / `SEQUENTIAL_EDIT`. File binary / quá lớn / đặc biệt: `hunks=()`, các map rỗng.
+5. `_line_stats` (5.9) tính cho `granularity ∈ {"lines", "last"}` (cờ code theo cùng quy tắc, R11): Σ(`added_code − deleted_code`) của file = LOC code C_END − C_START của file nên kiểm tra chéo §8.3 vẫn đúng. `files` của account gồm file có `last_touch_by` = account.
+6. `commit_stats` (R18) chỉ gồm các commit "cuối cùng" của từng file; Σ theo account bằng `UserLineStats`.
+
+Builder (spec `builder` 5.7a) xử lý `"last"` như `"whole"`: bản C_END nếu `last_touch_by` ∈ users, ngược lại bản C_START. Hiệu năng: mỗi file text chỉ 1 `diff` + 1 `rev_list`, không `blame` / `merge-base`.
 
 ### 5.2 Thông tin từng phía và mức xử lý
 Với mỗi `entry` của `td.entries`, phía cũ có khi `entry.old_path` khác None, phía mới có khi `entry.new_path` khác None.
@@ -172,7 +196,7 @@ Chỉ khi `cs` khác None và có phía cũ. `R_old` = các khoảng `[h.old_sta
    - `account(...)` None (commit không thuộc kỳ — phòng thủ) → giữ dòng + UNATTRIBUTED.
 
 ### 5.6 Merge (D23) — `resolve_merge(anchor, M, depth) -> sha | UNDETERMINED`
-`anchor = (S, path, j)`: dòng `j` của `path` tại commit S, S là tổ tiên của M, dòng vắng ở M. Memo theo `(S, path, j, M)`.
+`anchor = (S, path, j)`: dòng `j` của `path` tại commit S, S là tổ tiên của M, dòng vắng ở M. Memo theo `(S, path, j, M)` — **chỉ ghi nhớ kết quả không chạm giới hạn độ sâu** (A16): nếu trong quá trình tính (kể cả các tầng đệ quy bên dưới) có lần `depth > MAX_MERGE_DEPTH`, kết quả của lời gọi đó và mọi lời gọi bao ngoài nó không được lưu vào memo. Nhờ vậy kết quả của một khóa không phụ thuộc độ sâu mà khóa được gặp lần đầu — tái lập khi chạy song song (R15, 5.1a).
 1. `depth > MAX_MERGE_DEPTH` → `UNDETERMINED` (log WARNING).
 2. Với mỗi parent P của M **theo thứ tự `parents`**, tính `side(P)`:
    1. Tìm neo trên lịch sử của P:
@@ -182,7 +206,23 @@ Chỉ khi `cs` khác None và có phía cũ. `R_old` = các khoảng `[h.old_sta
    3. `r = repo.blame(P, neo.path, neo.commit, reverse=True, line_ranges=[(neo.j, neo.j+1)])[0]`; `r.sha == P` → `PRESENT`.
    4. Ngược lại `c = repo.first_commit_after(r.sha, P, [r.filename])`: None → `UNDETERMINED`; `c` không phải merge → `side = c`; `c` là merge → `side = resolve_merge((r.sha, r.filename, r.orig_line), c, depth + 1)`.
 3. Duyệt `side(P)` theo thứ tự parent: gặp kết quả đầu tiên khác `PRESENT` → trả nó (commit xóa, hoặc `UNDETERMINED`). Mọi parent `PRESENT` → trả `M` (merge tự xóa / giải quyết xung đột, §16).
-Có thể gom nhiều dòng cùng `(S, path, M)` vào một lệnh blame nhiều `-L` — kết quả phải như gọi từng dòng.
+Có thể gom nhiều dòng cùng `(S, path, M)` vào một lệnh blame nhiều `-L` — kết quả phải như gọi từng dòng (cách gom: mục 5.6a).
+
+### 5.6a Bộ nhớ đệm và gom lệnh git cho D23 (R19, A12, A13) — không đổi kết quả
+Đo thực tế (repo 15 000 commit, kỳ 2 ngày, 148/334 commit là merge): `resolve_merge` chiếm ~94% thời gian bước gán tác giả; mỗi dòng xóa nằm trong merge sinh ~6 tiến trình git (mỗi cái ~20 ms trên Windows), phần lớn lặp lại cùng truy vấn. Vì vậy `_Attributor` giữ các bộ nhớ đệm sau, **sống trong một lần `attribute_period`** (không chia sẻ giữa các lần chạy):
+1. **Truy vấn thuần theo cặp commit:** `is_ancestor(a, d)` theo `(a, d)`; `merge_bases(a, b)` theo `(a, b)`; `first_commit_after(since, until, paths)` theo `(since, until, tuple(paths))`. Áp dụng ở mọi chỗ attribution gọi chúng (5.5 bước 3 và 5.6). Lời gọi ném `GitError` → lỗi lan ra như cũ, **không** ghi nhớ.
+2. **Blame một dòng trong `_parent_side`:** blame xuôi bước 5.6.2.1 (`detect_moves=False`) ghi nhớ theo `(S, path, base, j)`; blame ngược bước 5.6.2.3 theo `(P, neo.path, neo.commit, neo.j)`. Chưa có trong bộ nhớ đệm → gọi `repo.blame` đúng như 5.6 (một dòng); có → dùng lại.
+3. **Làm nóng theo tầng (gom lệnh):** đo trên repo thật cho thấy nhóm `(L, fn)` ở 5.5 nhỏ (2–3 dòng) nhưng `resolve_merge` đệ quy sâu gấp ~10 lần (merge lồng nhau), nên làm nóng phải đi theo từng tầng đệ quy và gộp các dòng hội tụ về cùng `(S, path, M)`. Ở 5.5 bước 3, sau khi tính `cand` của **mọi** nhóm `(L, fn)` của file và **trước** khi gọi `resolve_merge` cho từng dòng, gom `groups = {(L, fn, cand): [orig_line…]}` cho các nhóm có `cand` là merge rồi chạy `_warm_merge(groups, depth=1)`:
+   - `depth > MAX_MERGE_DEPTH` hoặc `groups` rỗng → dừng (không git).
+   - Với mỗi khóa `(S, path, M)`: `pending` = các dòng `j` chưa có trong memo `(S, path, j, M)` (neo `(S, path, j)`). Với mỗi parent `P` của `M` **theo thứ tự `parents`** (dừng khi `pending` rỗng):
+     a. nếu `is_ancestor(S, P)` sai và `merge_bases(S, P)` đúng một phần tử `base`: gom các dòng của `pending` thành **một** `repo.blame(S, path, base, detect_moves=False, line_ranges=[…])` (chỉ dòng chưa có trong bộ nhớ đệm), nạp bộ nhớ đệm;
+     b. với các dòng có neo xác định (theo 5.6.2.1) và `neo.commit ≠ P`: gom theo `(neo.path, neo.commit)`, mỗi nhóm **một** `repo.blame(P, neo.path, neo.commit, reverse=True, line_ranges=[…])`, nạp bộ nhớ đệm;
+     c. xác định kết quả bên `P` của từng dòng theo 5.6.2 (đọc bộ nhớ đệm), **dừng trước khi đệ quy**: `PRESENT` → dòng ở lại `pending`; ngược lại dòng rời `pending`; nếu kết quả là "ứng viên `c` là merge" thì ghi nhận neo mới `(r.sha, r.filename, r.orig_line)` vào `nested[(r.sha, r.filename, c)]`.
+   - Sau khi xử lý hết các khóa của tầng: `_warm_merge(nested, depth + 1)` (nested gộp từ **mọi** khóa nên các dòng hội tụ về cùng `(S, path, M)` chung một lệnh blame).
+   - `_warm_merge` **chỉ nạp bộ nhớ đệm**; kết quả vẫn do `resolve_merge` từng dòng tính như 5.6 (vì vậy chữ ký và hành vi `resolve_merge`, `_parent_side`, memo `(S, path, j, M)` không đổi). Chỉ làm nóng cho parent mà cách tính tuần tự cũng sẽ tới (giữ thứ tự lười). Dòng rơi vào các nhánh 5.6.2 không cần blame (`neo.commit == P`; `fb` không boundary → `PRESENT`; `len(bases) != 1` → `UNDETERMINED`) thì không được đưa vào lệnh gom.
+   - Lỗi git khi làm nóng → ném lên như khi gọi tuần tự.
+   - Số lệnh `blame` mỗi `(khóa, parent)` không tỷ lệ theo số dòng (git_repo tự chia lô ≤ 200 khoảng mỗi lệnh).
+4. **Bất biến:** với mọi repo, `PeriodAttribution` (files, users, commit_stats, warnings, thứ tự) **bằng** kết quả khi tắt cả ba cơ chế trên (TC-46).
 
 ### 5.7 Ghép dời khối trong file (D28)
 Chỉ `granularity == "lines"` có **cả hai phía**. `key(line) = bytes của dòng bỏ mọi byte trong b" \t\n\v\f\r"` (như `-w`). Dòng lấy từ blob theo D8 (tách sau mỗi `\n`).
@@ -245,7 +285,7 @@ Thông báo không chứa lệnh git, URL hay token.
 
 ## 8. Bảo mật, hiệu năng, tái lập
 - Không nhận token; mọi git qua `GitRepo`.
-- Hiệu năng M4: mỗi file "lines" 1 diff + 1–2 blame xuôi + 1 blame ngược + `first_commit_after` theo nhóm `(L, filename)`; D23 thêm blame cho từng parent. Blob giữ trong bộ nhớ trong một lần chạy. (M5) sha và `commit_stats` không thêm lệnh git nào, không phân loại lại (dùng chung cờ 5.9). Tối ưu (song song, cache) để M7.
+- Hiệu năng M4: mỗi file "lines" 1 diff + 1–2 blame xuôi + 1 blame ngược + `first_commit_after` theo nhóm `(L, filename)`; D23 thêm blame cho từng parent. Blob giữ trong bộ nhớ trong một lần chạy. (M5) sha và `commit_stats` không thêm lệnh git nào, không phân loại lại (dùng chung cờ 5.9). **(M7) D23 dùng bộ nhớ đệm và gom blame theo nhóm (5.6a, R19):** mỗi truy vấn thuần theo cặp commit chạy tối đa một lần mỗi lần `attribute_period` khi chạy tuần tự (song song: có thể trùng khi hai luồng cùng hỏi một lúc, 5.1a.6 — kết quả không đổi); số lệnh blame cho một nhóm dòng xóa trong merge không tỷ lệ theo số dòng. **(R20) Song song theo file** với `ATTRIBUTION_WORKERS` luồng (5.1a): mỗi lệnh git là một tiến trình riêng nên các luồng chạy git đồng thời. Cache kết quả giữa các lần bấm "Phân tích" cùng kỳ: ở `pipeline` (`PeriodContext.attribution_memo`), không ở module này.
 - Tái lập: thứ tự file theo `diff_tree`; dict theo chỉ số tăng dần; lựa chọn "đầu tiên" theo thứ tự topo của git hoặc thứ tự `parents`; cảnh báo sắp ổn định (5.9); `users` sắp theo account. Không phụ thuộc cấu hình git toàn cục (nhờ `git_repo`).
 
 ## 9. Test cases
@@ -295,6 +335,13 @@ Fixture: `section14_repo` (conftest) và các repo nhỏ dựng trong `tests/con
 | TC-attribution-40 | (M5) sha của dòng dời (D22, D28) | repo TC-16, 17, 18 | TC-16: dòng của `b.py` có `added_commit` = commit dời của bob (lần blame 2), dòng cũ `a.py` `deleted_commit` = cùng commit. TC-17: mỗi cặp ghép (b): `deleted_commit[o] == added_commit[n]` = commit dời của alice. TC-18: mỗi cặp ghép (a): `added_commit[u] == deleted_commit[x]` | integration |
 | TC-attribution-41 | (M5) Bất biến 4b trên nhiều repo | kết quả `attribute_period` của các repo TC-02, 03, 11, 14, 16, 17, 18, 21, 22, 25, 28, 33, 34, 35, 36 (hàm trợ giúp trong test) | với mọi file: khóa / thứ tự `added_commit` = `added_by`, account khớp `commit_accounts`; tương tự phía xóa; Σ `commit_stats` theo account = `UserLineStats` (4 trường); `commit_stats` sắp theo sha, không có ô toàn 0, mọi sha thuộc `commit_accounts`; chạy 2 lần → bằng nhau | integration |
 | TC-attribution-42 | (M5) Không tạo ô / nhiều email | (a) repo TC-05 (rename thuần); (b) TC-24 (`whole`); (c) TC-31 (không commit); (d) TC-03 (C_START rỗng); (e) TC-28 (alice 2 email) | (a)(b)(c) `commit_stats == ()`; (d) có ô cho commit admin (`added_code` 7), alice, bob, mọi `deleted_*` = 0; (e) hai ô sha khác nhau, cùng `account == "alice"`, tổng = `user("alice")` | integration |
+| TC-attribution-44 | (R19) Bộ nhớ đệm truy vấn thuần | repo "merge nhiều dòng": `build_merge_multi_delete(src, n=4, fork_before=True/False)` — C_START có app.py = value_number_0..9; bob xóa 4 dòng liên tiếp (v2..v5) trên `feat`, alice sửa v8 trên main, carol merge `--no-ff` (parent đầu = main); spy `repo.is_ancestor`, `repo.merge_bases`, `repo.first_commit_after` | kết quả đúng: `deleted_by == {2: bob, 3: bob, 4: bob, 5: bob, 8: alice}`, `added_by == {4: alice}`, carol không có dòng, không cảnh báo; danh sách tham số của từng spy **không có phần tử trùng** (mỗi truy vấn tối đa một lần); `GitError` không bị ghi nhớ (unit: repo giả ném lỗi lần 1, lần 2 trả kết quả → lần 2 vẫn gọi repo) | integration + unit |
+| TC-attribution-45 | (R19) Gom blame theo nhóm | cùng repo TC-44 với `n = 1` và `n = 4`; `BlameSpy` | số lệnh `repo.blame` của `attribute_period` với n = 4 **bằng** với n = 1 (không tỷ lệ theo số dòng); có ít nhất một lệnh blame ngược/xuôi D23 với `line_ranges` phủ ≥ 4 dòng (`_merge_ranges` gộp thành 1 khoảng); `deleted_by` n = 4 đúng như TC-44 | integration |
+| TC-attribution-46 | (R19) Tối ưu không đổi kết quả (bất biến 5.6a.4) | repo TC-11, 12, 13, 14, 36 và TC-44 (cả hai `fork_before`): chạy `attribute()` bình thường; rồi chạy lại với `_Attributor._warm_merge` thay bằng hàm rỗng và các bộ nhớ đệm (`_anc_cache`, `_bases_cache`, `_fca_cache`, `_blame_cache`) thay bằng dict không lưu | hai `PeriodAttribution` bằng nhau hoàn toàn (files, users, commit_stats, warnings, thứ tự); bản không tối ưu gọi git **nhiều hơn** (đếm lời gọi `repo.blame`) trên repo TC-44 | integration |
+| TC-attribution-47 | (R20) Song song = tuần tự | (a) repo §14 (TC-02), TC-11, 14, 16, 17, 36, 44, `build_nested_multi`, `build_mixed_born_after_base` (mỗi repo thêm một commit sửa file phụ trong kỳ để **mọi** repo có ≥ 2 entry, assert điều đó) và một repo nhiều file (≥ 6 file đổi bởi alice/bob, có xóa qua merge): `attribute()` với `ATTRIBUTION_WORKERS = 1` và `= 4` (monkeypatch); (b) `repo.diff_hunks` giả ném `GitError` cho 2 file (file thứ 2 và thứ 4 theo `td.entries`) khi `= 4`; (c) `ContextVar` đặt ở luồng gọi, `repo.blame` giả ghi lại giá trị đọc được và tên luồng | (a) hai `PeriodAttribution` bằng nhau hoàn toàn; (b) ném `GitError` của file thứ 2; (c) task chạy ở luồng `loc-attr*` và đọc được giá trị `ContextVar` của luồng gọi | integration + unit |
+| TC-attribution-48 | (A16, review 2026-10-29) Kết quả bị cắt độ sâu không ghi nhớ; thứ tự lười theo parent; phủ nhánh làm nóng | (a) repo giả: `MAX_MERGE_DEPTH = 1`, `resolve_merge` tầng 1 có parent dẫn tới merge tầng 2 → kết quả `UNDETERMINED`, memo **rỗng**; gọi lại cùng khóa với `MAX_MERGE_DEPTH = 64` → tính lại được commit xóa; (b) back-merge: alice xóa v2 trên main, bob sửa v9 trên `feat`, carol merge `feat` vào main — BlameSpy; (c) `build_mixed_born_after_base` (nhóm có cả dòng sinh sau merge-base và dòng boundary), `build_nested_multi` (2 file, 3 dòng hội tụ ở độ sâu 2) | (a) như mô tả; (b) v2 → alice, v9 → bob; tổng số dòng được blame trên đầu `feat` (parent thứ hai) **bằng** bản không tối ưu (TC-46) — v2 có kết quả ở parent đầu nên không bị làm nóng trên `feat`, chỉ v9 (còn ở parent đầu) mới xét `feat`; (c) có trong TC-46 (bằng bản không tối ưu) và TC-47 (bằng bản tuần tự) | unit + integration |
+| TC-attribution-49 | (R21) Mode `last_commit` trên repo §14 | `app.py` bị alice (commit 2, 4) rồi bob (commit 5) chạm → cả file gán cho **bob**: alice `added_code=0`, `deleted_code=0`; bob `added_code=13` (5 của alice + 8 của `util.py`), `deleted_code=3`, net +10; `granularity=="last"`; Σ net = loc_end − loc_start (10→20); không `MULTI_USER_HUNK` / `MOVED_LINES`; spy `repo.blame` / `merge_bases` / `is_ancestor` không được gọi | integration |
+| TC-attribution-50 | (R21) Biên `last_commit` | (a) file binary: `granularity=="last"`, `last_touch_by` đúng, maps rỗng; (b) rename có sửa: `renamed_by == last_touch_by`; (c) commit cuối ngoài `commit_accounts`: `last_touch_by is None` + `UNATTRIBUTED`; (d) C_START rỗng: mọi dòng gán cho người sửa cuối; (e) `mode="line"` mặc định không đổi (TC-01..48 giữ nguyên); (f) song song = tuần tự | integration |
 | TC-attribution-43 | (M5) Tương thích dựng theo vị trí | `FileAttribution(...)` 10 tham số vị trí như `tests/test_builder.py`; `PeriodAttribution(...)` 6 tham số | `added_commit`, `deleted_commit` rỗng, chỉ đọc; `commit_stats == ()`; `commit("x") is None`; TC-01..37 và test `builder` không đổi | unit |
 
 ## 10. Câu hỏi mở / giả định
@@ -312,7 +359,15 @@ Fixture: `section14_repo` (conftest) và các repo nhỏ dựng trong `tests/con
 | A10 | (M5) `commit_stats` chỉ có commit có ≥ 1 dòng đã gán (không có ô toàn 0); số commit theo tuần lấy từ `commits` (spec `counter` 5.8), không từ đây | Giả định | Chốt theo khuyến nghị 2026-10-24 (*) |
 | A11 | (M5) D28 (a): dòng mới ghép được nhận sha **commit xóa** dòng cũ tương ứng (commit đã dời khối), (b) dòng cũ nhận sha của dòng mới D22 — nhất quán với account đã gán ở M4 | Cách thực hiện D35 + D28 | Chốt theo khuyến nghị 2026-10-24 (*) |
 
-(*) Người dùng ủy quyền "làm theo khuyến nghị không cần xác nhận lại" (2026-10-24); có thể đổi lại.
+| A12 | (R19) Bộ nhớ đệm chỉ sống trong một lần `attribute_period` (thuộc `_Attributor`), không lưu đĩa / không chia sẻ giữa các lần chạy; không đổi API công khai | Cách thực hiện hiệu năng | Chốt theo khuyến nghị 2026-10-28 (*) |
+| A13 | (R19) Làm nóng theo từng tầng đệ quy (gồm merge lồng nhau), gộp các dòng hội tụ về cùng `(S, path, M)` và giữ thứ tự parent lười. Bản đầu (chỉ tầng 1, nhóm ≥ 2 dòng) bị loại sau khi đo repo thật: tầng 1 chỉ 139 lần gọi nhưng đệ quy sâu hơn 1 467 lần | Phạm vi tối ưu (sửa theo số đo) | Chốt theo khuyến nghị 2026-10-28 (*) |
+
+| A14 | (R20) `ATTRIBUTION_WORKERS = min(8, os.cpu_count() or 1)`, hằng số module (không thêm tham số / config); tiến trình git đồng thời ≤ 8 | Khuyến nghị (đề xuất 2026-10-28 mục 2) | Chốt theo khuyến nghị 2026-10-29 (*) |
+| A15 | (R20) Log của luồng con: truyền context bằng `contextvars.copy_context()` cho từng task (module không biết gì về `run_log`); pipeline lọc theo `ContextVar` (spec `pipeline` A22) | Khuyến nghị | Chốt theo khuyến nghị 2026-10-29 (*) |
+| A16 | (review 2026-10-29, ghi chú 2) Memo `resolve_merge` không lưu kết quả chạm `MAX_MERGE_DEPTH` (cờ "bị cắt" theo luồng, lan lên các tầng bao ngoài) — giữ khóa `(S, path, j, M)`, không thêm `depth` vào khóa (giữ hiệu quả memo) | Khuyến nghị | Chốt theo khuyến nghị 2026-10-29 (*) |
+| A17 | (R21) `mode="last_commit"`: đơn vị là **file**, không phải dòng — người sửa cuối của file nhận toàn bộ dòng thêm / xóa của file trong kỳ, và khi chọn user đó thì export có bản C_END của file. Đây là cách hiểu yêu cầu "gán tác giả cho commit cuối cùng" | Khuyến nghị (ủy quyền 2026-10-30), có thể đổi |
+
+(*) Người dùng ủy quyền "làm theo khuyến nghị không cần xác nhận lại" (2026-10-24); có thể đổi lại. A14–A15: người dùng chọn "Làm 1,2" (2026-10-29). A12–A13: người dùng yêu cầu sửa spec, duyệt và code theo khuyến nghị (2026-10-28).
 
 ## 11. Lịch sử thay đổi
 | Ngày | Thay đổi | Lý do |
@@ -331,3 +386,13 @@ Fixture: `section14_repo` (conftest) và các repo nhỏ dựng trong `tests/con
 | 2026-10-24 | Chốt A9–A11 theo khuyến nghị (người dùng ủy quyền) → `approved` | Duyệt |
 | 2026-10-24 | Test pass (TC-01..43, 75 test; toàn bộ 512) → `implemented` | /feature-test |
 | 2026-10-24 | Review PASS_WITH_NOTES (reviews/attribution-20261024.md); sửa Minor: TC-41 thêm repo TC-24, TC-28 và kiểm chạy 2 lần cho TC-21, 22, 24, 25, 28, 33 (chỉ đổi test) → `reviewed` | /feature-review |
+| 2026-10-28 | Hiệu năng D23: thêm R19, mục 5.6a (bộ nhớ đệm `is_ancestor` / `merge_bases` / `first_commit_after` / blame một dòng; làm nóng gom blame nhiều dòng theo nhóm), cập nhật mục 8, TC-44..46, A12–A13. **Không đổi hành vi / kết quả gán tác giả** (§7 giữ nguyên). Trạng thái `reviewed` → `draft` | Đo thực tế: bước gán tác giả chậm, `resolve_merge` ~94% thời gian (12 421 lệnh git / 319 file, kỳ 2 ngày repo 15 000 commit) |
+| 2026-10-28 | Người dùng yêu cầu duyệt bản sửa và code theo khuyến nghị → `approved` | Duyệt |
+| 2026-10-28 | Sau khi code bản đầu và đo lại trên repo thật: bộ nhớ đệm giảm `is_ancestor` 4 222 → 263 nhưng blame vẫn từng dòng vì nhóm tầng 1 chỉ 2–3 dòng còn đệ quy sâu gấp ~10. Sửa 5.6a mục 3 (làm nóng theo tầng, gộp dòng hội tụ, A13). Không đổi kết quả / API / TC-44..46 (theo khuyến nghị đã ủy quyền, giữ `approved`) | Số đo thực tế |
+| 2026-10-28 | Test pass (TC-01..46, 80 test; toàn bộ 755; coverage 99 %) → `implemented`; chưa review lại (test-reports/attribution-perf-20261028.md) | /feature-test |
+| 2026-10-29 | Song song theo file: R20, mục 5.1a, `ATTRIBUTION_WORKERS`, mục 8, TC-47, A14–A15. Không đổi kết quả. `implemented` → `approved` (người dùng chọn "Làm 1,2" trong đề xuất tăng tốc; duyệt theo ủy quyền khuyến nghị) | Đề xuất tăng tốc 2026-10-28 mục 2 |
+| 2026-10-29 | Test pass (TC-01..47, 83 test; toàn bộ 761; coverage 99 %) → `implemented`; chưa review (test-reports/perf-parallel-20261029.md) | /feature-test |
+| 2026-10-29 | Sửa theo review `reviews/attribution-20261029.md` (PASS_WITH_NOTES): 5.6 memo không lưu kết quả chạm giới hạn độ sâu (A16, ghi chú 2 — tái lập khi song song; chỉ khác kết quả cũ trong ca chạm giới hạn 64); mục 8 sửa câu "tối đa một lần" (ghi chú 1); TC-47 (a) mọi repo ≥ 2 entry + 2 builder mới (Minor 1); TC-48 (Minor 2, 3). `implemented` → `approved` (theo ủy quyền khuyến nghị) | Review attribution |
+| 2026-10-29 | Test pass (TC-01..48, 89 test; toàn bộ 768; coverage 99 %); repo thật kết quả không đổi (40 316 / 6 937 / 338 cảnh báo, 3,0 phút). Review PASS_WITH_NOTES, mọi Minor + 2 Nit đã sửa → `reviewed` | /feature-test, /feature-review |
+| 2026-10-30 | Thêm `mode="last_commit"` (R21, mục 5.10, TC-49/50, A17), `Granularity` thêm `"last"`, tham số `mode` của `attribute_period`; mặc định `line` không đổi hành vi | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
+| 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |

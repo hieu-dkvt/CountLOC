@@ -901,3 +901,28 @@ def test_start_and_all_exports_path_checks(make_repo, cache_root: Path, tmp_path
         assert sorted(zf.namelist()) == paths
         assert zf.read("NUL.py") == b"n = 1\nn2 = 2\n"
         assert zf.read("src/a.py.") == b"d = 1\n"
+
+
+# ---------- TC-32: mode last_commit ----------
+def test_last_commit_export(section14_repo, cache_root: Path) -> None:
+    """TC-builder-32: export theo người sửa cuối — alice 10 (app.py bản start), bob 20."""
+    s14 = section14_repo()
+    base = bprepare(s14.src, cache_root)
+    attr = attribute_period(base.repo, base.snaps, base.commits, AccountResolver(),
+                            base.filters, mode="last_commit")
+    repo = base.repo
+
+    alice = base.export({A}, "alice", attr)
+    assert [f.path for f in alice.files] == ["app.py"]
+    assert built(alice, "app.py").blob_sha == blob_at(base, base.snaps.c_start.sha, "app.py")
+    assert loc_of(repo, alice.files) == 10
+
+    bob = base.export({B}, "bob", attr)
+    assert [f.path for f in bob.files] == ["app.py", "util.py"]
+    assert content_of(repo, built(bob, "app.py")) == s14.app_end.encode()
+    assert loc_of(repo, bob.files) == 20
+
+    both = base.export({A, B}, "multi-2users", attr)
+    assert files_map(repo, both) == files_map(repo, bob)
+    assert loc_of(repo, both.files) == 20
+    assert files_map(repo, base.export({B}, "bob", attr)) == files_map(repo, bob)

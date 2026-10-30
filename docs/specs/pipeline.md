@@ -7,7 +7,7 @@ modules: [src/loc_counter/pipeline.py]
 tests: [tests/test_pipeline.py]
 spec_refs: ["3.1", "3.2", "3.3", "3.4", "3.5", "8.1", "8.2", "8.3", "10.2", "12", "15", "16"]
 depends_on: [config, git_repo, snapshot, identity, attribution, builder, counter, report, classifier]
-status: reviewed
+status: implemented
 ---
 
 # Pipeline phân tích
@@ -75,6 +75,7 @@ class AnalysisRequest:
     users: tuple[str, ...] | None = None      # None = "Tất cả user"; giá trị thô (--user / UI)
     exclude_bots: bool = False
     separate_users: bool = False
+    attribution_mode: AttributionMode = "line"   # "last_commit": gán theo commit cuối của file (attribution 5.10)
 
 @dataclass(frozen=True)
 class PeriodContext:
@@ -83,6 +84,10 @@ class PeriodContext:
     snapshots: Snapshots
     commits: tuple[LogCommit, ...]
     users: UsersResult                        # summarize_users(commits, resolver)
+    # (A21) kết quả gán tác giả đã tính cho ctx này: FilterConfig → (weakref.ref(resolver),
+    # PeriodAttribution); tối đa 1 phần tử; init=False (dataclasses.replace tạo memo rỗng mới),
+    # không tham gia so sánh / repr; dựng theo vị trí 5 tham số vẫn hợp lệ
+    attribution_memo: dict = field(default_factory=dict, init=False, compare=False, repr=False)
 
 @dataclass(frozen=True)
 class AnalysisResult:
@@ -120,7 +125,7 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
     """Chạy toàn bộ phân tích, ghi thư mục kết quả; trả dữ liệu cho CLI / UI."""
 ```
 
-Không có trường / tham số chứa token trong `AnalysisRequest`, `PeriodContext`, `AnalysisResult` (TC-24). Token chỉ đi vào `make_resolver` (giữ trong `GitHubLoginResolver`) và `run_log(secrets=…)` (giữ trong formatter).
+Không có trường / tham số chứa token trong `AnalysisRequest`, `PeriodContext`, `AnalysisResult` (TC-24); `PeriodContext.attribution_memo` chỉ giữ **weakref** tới resolver (không giữ token, A21). Token chỉ đi vào `make_resolver` (giữ trong `GitHubLoginResolver`) và `run_log(secrets=…)` (giữ trong formatter).
 
 Cách gọi chuẩn (CLI, UI):
 ```python
@@ -136,6 +141,7 @@ with run_log(out_root, secrets=(token,)):         # CLI bọc cả GitRepo.open 
 | `request.users` | tuple[str] \| None | None ("Tất cả user") | `()` → lỗi "Chưa chọn user nào" | §3.3, §10.2 [3] |
 | `request.exclude_bots` | bool | False | | §16 |
 | `request.separate_users` | bool | False | | §3.3 |
+| `request.attribution_mode` | `"line"` \| `"last_commit"` | `"line"` | khác → `ValueError` | yêu cầu 2026-10-30 |
 | `request.period.timezone` | str | `Asia/Bangkok` (từ `make_period`) | thắng `config.timezone` (A10) | §3.1 |
 | `request.out_root` | Path | — (CLI bắt buộc `--out`) | chưa có → tạo; là file → lỗi | §11, §12 |
 | `progress` | callback \| None | None | gọi lúc **bắt đầu** mỗi bước | §10.2 |
@@ -174,7 +180,7 @@ with run_log(out_root, secrets=(token,)):         # CLI bọc cả GitRepo.open 
 ### 5.5 `run_log(out_root, secrets)` (D40-N12, A1, A2, A16)
 1. `out_root = Path(out_root).resolve()`; là file → `PipelineError("Thư mục đầu ra là một file: <out_root>")`; chưa có → `mkdir(parents=True)` (`OSError` → `PipelineError("Không tạo được thư mục đầu ra <out_root>: <lỗi>")`).
 2. `handler = logging.FileHandler(out_root / RUN_LOG_NAME, mode="w", encoding="utf-8")` (`OSError` → `PipelineError("Không ghi được run.log: <lỗi>")`); level INFO; formatter `_MaskingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")` — `format()` gọi lớp cha rồi `git_repo.mask_secrets(text, secrets)` (che cả message lẫn traceback, che dạng base64 `x-access-token:<t>`; không sửa `LogRecord`).
-3. Filter chỉ nhận record của **luồng** đã vào `with` (`record.thread == threading.get_ident()` — nhiều phiên Streamlit song song, A16).
+3. Filter chỉ nhận record của **phiên** đã vào `with` (nhiều phiên Streamlit song song, A16): record của **luồng** đã vào `with` (`record.thread == threading.get_ident()`), **hoặc** record phát khi `ContextVar` `_RUN_LOG_ID` (module-level) bằng mã của phiên này (A22). Vào `with`: `token = _RUN_LOG_ID.set(<mã duy nhất của phiên>)`; `finally` theo thứ tự: gỡ handler, `close()`, khôi phục level (bước 5) **rồi mới** `_RUN_LOG_ID.reset(token)` bọc `suppress(ValueError)` — thoát `with` ở context khác (vd. generator bị đóng ở luồng khác) không được làm sót handler / khóa `run.log` / lệch bộ đếm level. Luồng con nhận context của phiên khi được chạy qua `contextvars.copy_context().run` (vd. `attribution` 5.1a); luồng tạo bằng `threading.Thread` thông thường không mang context → vẫn bị loại như cũ.
 4. Gắn handler vào logger `loc_counter`. Level của logger (tài nguyên dùng chung cả tiến trình) chỉnh theo **đếm tham chiếu có khóa** (`_LEVEL_LOCK`, số phiên đang mở, level đã lưu — A18): phiên **đầu tiên** vào lưu `logger.level` rồi, nếu `logger.getEffectiveLevel() > INFO`, đặt `logger.setLevel(INFO)`; các phiên sau chỉ tăng bộ đếm. `yield out_root / RUN_LOG_NAME`.
 5. `finally`: gỡ handler, `handler.close()` (Windows nhả khóa file ngay); giảm bộ đếm, phiên **cuối cùng** ra khôi phục level đã lưu.
 
@@ -197,7 +203,7 @@ Ký hiệu: `cfg = request.config`, `filters = cfg.filters`, `tz = request.perio
 11. Cảnh báo phạm vi `start`: `start_plan.warnings` + `path_conflict_warnings(paths, "start")` + `windows_path_warnings(paths)` với `paths = [f.path for f in start_plan.files]`.
 
 **Bước 2 — Gán tác giả**
-12. `step(ATTRIBUTION)`; `classifier = LineClassifier(filters.count_docstrings)` (dùng chung đến hết); `attr = attribute_period(repo, snaps, commits, resolver, filters, classifier)`. Cảnh báo phạm vi `gán tác giả`: `attr.warnings`.
+12. `step(ATTRIBUTION)`; `classifier = LineClassifier(filters.count_docstrings)` (dùng chung đến hết); `attr` lấy từ `ctx.attribution_memo` (A21): có khóa `(filters, request.attribution_mode)` và weakref lưu kèm trỏ tới **đúng** (`is`) `resolver` của lần gọi này → dùng lại, log INFO `Dùng lại kết quả gán tác giả đã tính cho kỳ này`; ngược lại (kể cả weakref đã chết) `attr = attribute_period(repo, snaps, commits, resolver, filters, classifier, mode=request.attribution_mode)` rồi `ctx.attribution_memo.clear(); ctx.attribution_memo[(filters, request.attribution_mode)] = (weakref.ref(resolver), attr)`. Cảnh báo phạm vi `gán tác giả`: `attr.warnings`.
 
 **Bước 3 — Export end**
 13. `step(EXPORT_END)`. `end_plan = plan_export(repo, snaps.c_end.sha, filters)` chỉ khi có job `accounts is None` (tính một lần).
@@ -220,7 +226,7 @@ Ký hiệu: `cfg = request.config`, `filters = cfg.filters`, `tz = request.perio
 **Bước 5 — Tạo báo cáo**
 20. `step(REPORT)`. `warnings = _merge_warnings(...)` (5.10).
 21. `exports = (ExportSummary("start", start_name, None, None, len(start_plan.files), loc_start), ExportSummary("end", end_names[0], main.tag, main.accounts, len(main_export.files), loc_end, check), *[ExportSummary("separate", …, check_i)])`.
-22. `data = ReportData(repo=repo.source, branch=snaps.branch, period=period, c_start=snaps.c_start, c_end=snaps.c_end, users=counted, all_users=selected is None, config=dataclasses.replace(cfg, timezone=tz), options=ReportOptions(selected, request.exclude_bots, request.separate_users), loc_start=…, loc_end=…, languages=tuple(languages), user_rows=tuple(user_rows), files=tuple(files), weeks=tuple(weeks), cross_check=check, warnings=warnings, exports=exports)`.
+22. `data = ReportData(repo=repo.source, branch=snaps.branch, period=period, c_start=snaps.c_start, c_end=snaps.c_end, users=counted, all_users=selected is None, config=dataclasses.replace(cfg, timezone=tz), options=ReportOptions(selected, request.exclude_bots, request.separate_users, request.attribution_mode), loc_start=…, loc_end=…, languages=tuple(languages), user_rows=tuple(user_rows), files=tuple(files), weeks=tuple(weeks), cross_check=check, warnings=warnings, exports=exports)`.
 23. `generated_at = (now or default)()`; `report_files = write_reports(tmp, data, generated_at)`.
 24. `_commit_dir(tmp, final)` (5.9). Log INFO `Kết quả: <final>`.
 25. Trả `AnalysisResult(final, data, snaps, tuple(summaries), final / start_name, tuple(final / n for n in end_names), tuple(final / p.name for p in report_files), generated_at)`.
@@ -286,7 +292,7 @@ Khử trùng theo khóa `(kind, path, message)`: giữ vị trí lần đầu xu
 
 ## 8. Bảo mật, hiệu năng, tái lập
 - **Token:** không có trong request / context / result; không truyền vào hàm nào của pipeline ngoài `make_resolver` và `run_log(secrets)`. `run.log` che token qua `_MaskingFormatter` (cả dạng base64); `GitError` đã che sẵn. `ReportData.repo = repo.source` (URL https có thông tin xác thực bị `normalize_source` từ chối). Mật khẩu trong `ssh://` / `git://` / `file://` / scp cũng bị từ chối (`git_repo` 5.3, 2026-10-25).
-- **Hiệu năng (M5):** một `LineClassifier` chung (cache theo blob SHA) cho gán tác giả và mọi lần đếm; `plan_export(C_END)` một lần; mỗi zip đọc blob 2 lần (ghi + đếm) — chấp nhận, tối ưu ở M7.
+- **Hiệu năng (M5):** một `LineClassifier` chung (cache theo blob SHA) cho gán tác giả và mọi lần đếm; `plan_export(C_END)` một lần; mỗi zip đọc blob 2 lần (ghi + đếm) — chấp nhận, tối ưu ở M7. **(A21)** Bấm "Phân tích" lại với cùng `PeriodContext` (UI dùng lại qua `period_memo`), cùng bộ lọc và cùng resolver → không gán tác giả lại (kết quả không phụ thuộc user được chọn — attribution A1). CLI tạo `ctx` mới mỗi lần nên không dùng memo.
 - **Tái lập:** thứ tự job theo `plan_end_exports`; cảnh báo theo 5.10 (tất định); zip start timestamp C_START, zip end C_END (theo `tz`); xlsx chuẩn hóa theo C_END (`report`); `generated_at` chỉ ở manifest; tên thư mục tạm không lọt vào file đầu ra; bảng do `report` sắp lại.
 - **Windows:** `FileHandler` gỡ + đóng trong `finally`; `os.replace` không đè thư mục đã có → đổi tên thư mục cũ trước (5.9); kiểm độ dài đường dẫn (5.8); LOC đếm từ nội dung (D36) nên `A.py`/`a.py`, `CON.py` vẫn được đếm.
 
@@ -331,6 +337,9 @@ Fixture: `section14_repo` (thêm tham số tên repo nguồn để thư mục l�
 | TC-pipeline-34 | Timestamp zip | TC-01 | entry zip start mang committer date C_START, zip end mang C_END theo `Asia/Bangkok` | integration |
 | TC-pipeline-36 | Nhánh lỗi hệ thống tệp (mục 7) | monkeypatch: `mkdir` của `out_root` lỗi; `FileHandler` lỗi; `mkdir` thư mục tạm lỗi; `os.replace(tmp, final)` lỗi khi đích chưa có; có thư mục cũ và `os.replace(tmp, final)` lỗi (`OSError`, `KeyboardInterrupt`); `shutil.rmtree(old)` lỗi | `PipelineError` đúng thông báo mục 7 (lần lượt "Không tạo được thư mục đầu ra", "Không ghi được run.log", "Không tạo được thư mục tạm", "Không đổi tên thư mục tạm thành"); thư mục cũ được khôi phục nguyên vẹn (`OSError` → `PipelineError` "Không thay thế được thư mục kết quả cũ", `KeyboardInterrupt` ném lại nguyên); không còn `.loc-tmp-*`; rmtree lỗi → vẫn trả kết quả, log WARNING "Không xóa được thư mục cũ"; biến thể khôi phục `os.replace(old, final)` cũng lỗi → thông báo và log ERROR chứa đường dẫn `.loc-old-*`, dữ liệu cũ còn trong đó | unit |
 | TC-pipeline-37 | Kiểm tra chéo lệch hệ thống: thư mục loại / symlink (D40-N6) | c0: `app.py`, `lib.py` (10 dòng code mỗi file); trong kỳ alice (a) `git mv lib.py vendor/lib.py`; (b) thay `lib.py` bằng symlink 120000 trỏ `app.py` | cả hai: không ném lỗi; `cross_check` = `(20, 0, 10)`, `ok` false, `diff_percent` 100.0; alice `net_code` 0; đúng một cảnh báo `cross_check` phạm vi `kiểm tra chéo`; manifest `cross_check.ok == false`; export end không có `vendor/lib.py` / `lib.py` | integration |
+| TC-pipeline-38 | Dùng lại kết quả gán tác giả (A21) | repo §14; `ctx = prepare_period(...)`; spy `pipeline.attribute_period`; chạy `run_analysis(context=ctx)` lần lượt: (1) mọi user; (2) chọn `alice` (cùng filters, cùng resolver); (3) `count_docstrings` khác; (4) resolver mới (cùng filters như 3); mỗi lần `out_root` riêng | spy gọi ở (1), (3), (4) — **không** gọi ở (2); `run.log` của (2) có `Dùng lại kết quả gán tác giả đã tính cho kỳ này`, của (1), (3), (4) thì không; lần (2) bằng một lần chạy (2) với ctx mới: `ReportData` bằng nhau, mọi file kết quả trùng SHA-256 (kể cả manifest, cùng `now`); `len(ctx.attribution_memo) == 1`; `PeriodContext` 5 tham số vị trí vẫn dựng được, hai ctx khác memo vẫn bằng nhau; `dataclasses.replace(ctx)` có memo rỗng; memo không giữ tham chiếu mạnh tới resolver (resolver bị thu hồi → weakref chết → tính lại) | integration |
+| TC-pipeline-39 | Log của luồng con vào `run.log` (A22) | trong `with run_log(...)`: (a) phát WARNING từ `ThreadPoolExecutor` với `contextvars.copy_context().run`; (b) phát WARNING từ `threading.Thread` thường; (c) chạy `attribute_period` trên repo TC-attribution-11 với `MAX_MERGE_DEPTH = 0`, `ATTRIBUTION_WORKERS = 4`; (d) hai phiên `run_log` lồng ở hai luồng khác nhau, mỗi phiên một luồng con có context | (a) có trong `run.log`; (b) không có; (c) `run.log` có `Vượt giới hạn đệ quy merge`; (d) mỗi `run.log` chỉ có log của phiên mình; sau `with`, `_RUN_LOG_ID` trở về như trước (ở luồng chính và trong từng luồng phiên); (e) `__enter__` trong một context, `__exit__` ở context khác → không ném lỗi, handler đã gỡ, level logger khôi phục, `run.log` xóa được | unit + integration |
+| TC-pipeline-40 | Chế độ gán `last_commit` (A23) | repo §14 + identities: (a) `AnalysisRequest(attribution_mode="last_commit")`, tất cả user → 10/20, cross_check 0, `manifest.options.attribution_mode == "last_commit"`; (b) `--user alice` → 10/10, `--user bob` → 10/20; (c) spy `attribute_period` nhận `mode`; hai lần chạy cùng `ctx` khác mode → gọi lại (memo khóa theo mode); (d) `mode` lạ → `ValueError` | integration |
 | TC-pipeline-35 | `make_resolver` | nguồn GitHub + token; GitHub không token; nguồn local + token | `github` là `GitHubLoginResolver` (cache = `login_cache`); `None`; `None` | unit |
 
 Phủ mandatory-tests: mục D (kiểm tra chéo §8.3) — TC-01..04, 19; mục E — TC-07, 08, 24, 25, 28 (+ tên thư mục / user-tag TC-01..05).
@@ -359,13 +368,25 @@ Phủ mandatory-tests: mục D (kiểm tra chéo §8.3) — TC-01..04, 19; mục
 | A19 | Lỗi `mkdir` thư mục tạm và `os.replace(tmp, final)` (đích chưa có) → `PipelineError` tiếng Việt; lỗi bất kỳ giữa hai lần đổi tên → khôi phục thư mục cũ trước khi ném | Khuyến nghị review | Chốt (*) |
 | A20 | Hai phiên cùng `out_root` cùng ghi một `run.log` (`mode="w"`) → file hỏng. M5 (CLI một phiên) chấp nhận, ghi README; cách xử lý cho nhiều phiên Streamlit quyết ở M6 (PLAN Q46) | Khuyến nghị review | Chốt cho M5 (*), mở cho M6 |
 
+| A21 | Memo gán tác giả gắn vào `PeriodContext` (vòng đời theo memo kỳ của UI; mỗi memo gắn với đúng một ctx — `init=False` nên `replace` không chia sẻ memo), khóa `FilterConfig` (gồm `count_docstrings` → classifier) + đồng nhất resolver qua **weakref** (`ref() is resolver`: không trùng `id()` sau thu hồi, ctx không giữ token); giữ 1 phần tử | Khuyến nghị (đề xuất tăng tốc 2026-10-28 mục 2) | Chốt 2026-10-29 (**) |
+| A22 | Lọc `run.log` theo luồng **hoặc** `ContextVar` của phiên, để log của luồng gán tác giả song song (attribution R20) không bị mất | Khuyến nghị | Chốt 2026-10-29 (**) |
+| A23 | `attribution_mode` đi qua `AnalysisRequest` → `attribute_period(mode=…)` và `ReportOptions.attribution_mode` (manifest). Memo A21 khóa theo `(filters, mode)`: đổi chế độ thì tính lại. TC-pipeline-40 | Khuyến nghị (ủy quyền 2026-10-30) |
+
+(**) Người dùng chọn "Làm 1,2" (2026-10-29); duyệt theo ủy quyền làm theo khuyến nghị.
+
 (*) Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-23 ("trường hợp có hỏi xác nhận thì thực hiện theo recommend"); có thể đổi lại.
 
 ## 11. Lịch sử thay đổi
 | Ngày | Thay đổi | Lý do |
 |---|---|---|
+| 2026-10-29 | `PeriodContext.attribution_memo` + 5.6 bước 12 dùng lại kết quả gán tác giả (A21); 5.5 bước 3 lọc `run.log` theo luồng hoặc `ContextVar` phiên (A22); mục 8; TC-38, 39. `reviewed` → `approved` | Đề xuất tăng tốc mục 2 (attribution R20 song song) |
+| 2026-10-29 | Test pass (TC-38, 39; toàn bộ 761; coverage `pipeline.py` 99 %) → `implemented`; chưa review | /feature-test |
+| 2026-10-29 | Sửa theo review `reviews/pipeline-20261029.md` (PASS_WITH_NOTES): memo `init=False` + weakref resolver (Minor 2, ghi chú spec 1–2); thứ tự `finally` của `run_log`, `reset` bọc `suppress(ValueError)` (Minor 1, ghi chú 5); TC-38 so `ReportData` + manifest + log (Minor 3); TC-39 (d)(e) (Nit 1, Minor 1). Không đổi kết quả. `implemented` → `approved` (duyệt theo ủy quyền làm theo khuyến nghị; người dùng yêu cầu chạy review và xử lý) | Review pipeline |
+| 2026-10-29 | Test pass (50 test pipeline; toàn bộ 768; coverage 99 %). Review PASS_WITH_NOTES, mọi Minor + Nit 1 đã sửa → `reviewed` | /feature-test, /feature-review |
 | 2026-10-25 | Theo review `reviews/pipeline-20261025.md`: 5.5 bước 4–5 đếm tham chiếu level logger (A18); 5.6 bước 9, 5.9 bọc lỗi thư mục tạm / đổi tên, khôi phục thư mục cũ với mọi lỗi giữa hai lần đổi tên (A19); 5.6 bước 19 thứ tự log + kiểm tra chéo từng zip riêng; mục 7 thêm 3 dòng; TC-16 sửa "25" → "26 user" (khớp "… và 6 user khác"); TC-27, TC-33 mở rộng; thêm TC-36; A20 (`run.log` dùng chung, PLAN Q46). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | review FAIL (Major + Minor) |
 | 2026-10-25 | Mục bảo mật: bỏ ghi chú tồn đọng `ssh://user:pass` (đã xử lý ở `git_repo` 5.3) — chỉ cập nhật tài liệu, không đổi hành vi pipeline | Tồn đọng M5 |
 | 2026-10-25 | TC-37: ca lệch kiểm tra chéo vendor/ và file→symlink (fixture PLAN M5) — chỉ thêm test, không đổi hành vi | Tồn đọng M5 |
 | 2026-10-25 | 5.9: khôi phục thư mục cũ lỗi → log ERROR + thông báo nêu đường dẫn `.loc-old-*`; TC-36 thêm biến thể. Chốt theo khuyến nghị, người dùng ủy quyền | review r2 Minor |
 | 2026-10-24 | Tạo mới theo PLAN M5 (phạm vi `pipeline`, D11, D13, D21, D31, D35–D40) + phân tích `spec-analyst` (N1–N19, API thực tế các module; thử nghiệm `os.replace`/`rmtree` trên Windows, `LongPathsEnabled`). A1–A17 chốt theo khuyến nghị, người dùng ủy quyền → `approved` | M5 (`/feature-spec pipeline`) |
+| 2026-10-30 | `AnalysisRequest.attribution_mode`, truyền vào `attribute_period` và `ReportOptions`, memo khóa theo `(filters, mode)` (A23, TC-40) | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
+| 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |

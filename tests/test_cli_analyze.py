@@ -520,3 +520,25 @@ def test_number_format(repo14: str, env: SimpleNamespace,
     assert empty.exit_code == 0, empty.output
     lines = empty.stdout.splitlines()
     assert lines[lines.index("Theo ngôn ngữ") + 1] == "Không có file source nào."
+
+
+def test_attribution_option(repo14: str, env: SimpleNamespace,
+                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-cli-analyze-26: --attribution line | last-commit."""
+    modes: list[str] = []
+    orig_run = pipeline.run_analysis
+
+    def spy_run(*a: Any, **k: Any) -> Any:
+        modes.append(a[1].attribution_mode)
+        return orig_run(*a, **k)
+
+    monkeypatch.setattr(pipeline, "run_analysis", spy_run)
+    plain = invoke(*base(repo14, env))
+    assert plain.exit_code == 0 and "Cách gán tác giả:" not in plain.output
+    last = invoke(*base(repo14, env, "--attribution", "last-commit", out=env.tmp / "out2"))
+    assert last.exit_code == 0
+    assert "Cách gán tác giả: Theo commit cuối cùng của file" in last.output
+    assert modes == ["line", "last_commit"]
+    assert manifest_of(env.tmp / "out2" / ALL_DIR)["options"]["attribution_mode"] == "last_commit"
+    bad = invoke(*base(repo14, env, "--attribution", "x", out=env.tmp / "out3"))
+    assert bad.exit_code == 2 and not (env.tmp / "out3").exists()

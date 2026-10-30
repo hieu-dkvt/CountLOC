@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -10,16 +11,18 @@ import os
 import re
 import shutil
 import threading
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import StrEnum
 from pathlib import Path
 from secrets import token_hex
+from time import sleep
 from zoneinfo import ZoneInfo
 
-from loc_counter.attribution import attribute_period
+from loc_counter.attribution import AttributionMode, PeriodAttribution, attribute_period
 from loc_counter.builder import (
     UserExport,
     build_user_export,
@@ -30,7 +33,7 @@ from loc_counter.builder import (
     write_user_export,
 )
 from loc_counter.classifier import LineClassifier
-from loc_counter.config import AppConfig, LocCounterError
+from loc_counter.config import AppConfig, FilterConfig, LocCounterError
 from loc_counter.counter import (
     CountResult,
     LocWarning,
@@ -88,7 +91,8 @@ from loc_counter.snapshot import (
 logger = logging.getLogger(__name__)
 
 RUN_LOG_NAME = "run.log"
-TMP_PREFIX = ".loc-tmp-"          # thư mục tạm trong <out>
+_REPLACE_RETRIES = 10             # số lần thử os.replace khi Windows báo Access denied
+TMP_PREFIX = ".loc-tmp-"        # thư mục tạm trong <out>
 OLD_PREFIX = ".loc-old-"          # thư mục cũ đang chờ xóa
 NAME_PART_MAX = 40                # độ dài tối đa <repo>, <branch> trong tên thư mục
 WINDOWS_MAX_PATH = 259            # khi Windows chưa bật long path
@@ -107,6 +111,8 @@ _NAME_SAMPLE = "9" * 10 + "-" + "f" * 8  # <pid tối đa 10 chữ số>-<8 hex>
 _LEVEL_LOCK = threading.Lock()
 _level_sessions = 0
 _saved_level = logging.NOTSET
+# mã phiên run_log; luồng con chạy qua contextvars.copy_context() mang theo (A22)
+_RUN_LOG_ID: contextvars.ContextVar[str] = contextvars.ContextVar("loc_counter_run_log")
 
 
 class Step(StrEnum):
@@ -141,6 +147,7 @@ class AnalysisRequest:
     users: tuple[str, ...] | None = None
     exclude_bots: bool = False
     separate_users: bool = False
+    attribution_mode: AttributionMode = "line"
 
 
 @dataclass(frozen=True)
@@ -152,6 +159,11 @@ class PeriodContext:
     snapshots: Snapshots
     commits: tuple[LogCommit, ...]
     users: UsersResult
+    # (FilterConfig, chế độ gán) → (weakref resolver, PeriodAttribution) đã tính; tối đa 1 phần tử.
+    # init=False: replace() tạo memo rỗng mới; weakref: ctx không giữ resolver (token) — A21
+    attribution_memo: dict[tuple[FilterConfig, str],
+                           tuple[weakref.ref[AccountResolver], PeriodAttribution]] = (
+        field(default_factory=dict, init=False, compare=False, repr=False))
 
 
 @dataclass(frozen=True)
@@ -297,16 +309,22 @@ def run_log(out_root: Path, secrets: Sequence[str | None] = ()) -> Iterator[Path
     handler.setLevel(logging.INFO)
     handler.setFormatter(_MaskingFormatter(_LOG_FORMAT, secrets))
     thread_id = threading.get_ident()
-    handler.addFilter(lambda record: record.thread == thread_id)
+    run_id = token_hex(8)
+    handler.addFilter(lambda record: (record.thread == thread_id
+                                      or _RUN_LOG_ID.get(None) == run_id))
     package = logging.getLogger(_PACKAGE_LOGGER)
     package.addHandler(handler)
     _acquire_level(package)
+    run_token = _RUN_LOG_ID.set(run_id)
     try:
         yield path
     finally:
         package.removeHandler(handler)
         handler.close()
         _release_level(package)
+        # thoát ở context khác (generator đóng ở luồng khác) → token không reset được; bỏ qua
+        with suppress(ValueError):
+            _RUN_LOG_ID.reset(run_token)
 
 
 def _acquire_level(package: logging.Logger) -> None:
@@ -383,23 +401,39 @@ def _check_path_lengths(out_root: Path, final: Path, names: Sequence[str]) -> No
                      "gộp account bằng identities.yaml.")
 
 
+def _replace(src: Path, dst: Path) -> None:
+    """os.replace; Windows báo PermissionError (WinError 5) thoáng qua khi antivirus/indexer
+    đang giữ file trong thư mục → thử lại vài lần với thời gian chờ tăng dần."""
+    delay = 0.05
+    for _ in range(_REPLACE_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            sleep(delay)
+            delay = min(delay * 2, 1.0)
+    os.replace(src, dst)
+
+
 def _commit_dir(tmp: Path, final: Path) -> None:
     """Đưa thư mục tạm thành thư mục kết quả; thư mục cũ đổi tên rồi xóa (A7)."""
     if not os.path.lexists(final):
         try:
-            os.replace(tmp, final)
+            _replace(tmp, final)
         except OSError as exc:
             raise _error(f"Không đổi tên thư mục tạm thành {final}: {exc}") from exc
         return
     _check_target(final)
     old = final.parent / f"{OLD_PREFIX}{os.getpid()}-{token_hex(4)}"
     try:
-        os.replace(final, old)
+        _replace(final, old)
     except OSError as exc:
         raise _error(f"Không thay thế được thư mục kết quả cũ {final} "
                      f"(có file đang mở?): {exc}") from exc
     try:
-        os.replace(tmp, final)
+        _replace(tmp, final)
     except BaseException as exc:  # kể cả KeyboardInterrupt: đưa thư mục cũ về chỗ (A19)
         lost = ""
         try:
@@ -445,6 +479,8 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
     period = request.period
     tz = period.timezone
     order = list(Step)
+    if request.attribution_mode not in ("line", "last_commit"):
+        raise ValueError(f"attribution_mode không hợp lệ: {request.attribution_mode!r}")
 
     def step(s: Step) -> None:
         if progress is not None:
@@ -484,7 +520,16 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
         # Bước 2 — Gán tác giả
         step(Step.ATTRIBUTION)
         classifier = LineClassifier(filters.count_docstrings)
-        attr = attribute_period(repo, snaps, commits, resolver, filters, classifier)
+        memo_key = (filters, request.attribution_mode)
+        memo = ctx.attribution_memo.get(memo_key)
+        if memo is not None and memo[0]() is resolver:
+            attr = memo[1]
+            logger.info("Dùng lại kết quả gán tác giả đã tính cho kỳ này")
+        else:
+            attr = attribute_period(repo, snaps, commits, resolver, filters, classifier,
+                                    mode=request.attribution_mode)
+            ctx.attribution_memo.clear()
+            ctx.attribution_memo[memo_key] = (weakref.ref(resolver), attr)
 
         # Bước 3 — Export end
         step(Step.EXPORT_END)
@@ -566,7 +611,8 @@ def run_analysis(repo: GitRepo, request: AnalysisRequest, resolver: AccountResol
             repo=repo.source, branch=snaps.branch, period=period, c_start=snaps.c_start,
             c_end=snaps.c_end, users=counted, all_users=selected is None,
             config=dataclasses.replace(cfg, timezone=tz),
-            options=ReportOptions(selected, request.exclude_bots, request.separate_users),
+            options=ReportOptions(selected, request.exclude_bots, request.separate_users,
+                                  request.attribution_mode),
             loc_start=loc_start, loc_end=loc_end, languages=tuple(languages),
             user_rows=tuple(user_rows), files=tuple(files), weeks=tuple(weeks),
             cross_check=check, warnings=warnings, exports=tuple(summaries_out))

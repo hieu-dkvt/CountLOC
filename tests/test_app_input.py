@@ -278,7 +278,7 @@ def test_advanced_options(make_app, s14: Path, tmp_path: Path) -> None:
     at.text_input(key="config_path").set_value(str(cfg)).run()
     at.button(key="load_config").click().run()
     assert at.checkbox(key="adv_include_tests").value is False
-    assert at.selectbox(key="tz").value == "UTC"
+    assert at.session_state["tz"] == "UTC"
     assert at.text_area(key="adv_exclude_dirs").value == "x\ny"
 
     bad = tmp_path / "bad.yaml"
@@ -520,10 +520,11 @@ def test_selection_dropped_when_period_changes(make_app, s14: Path) -> None:
 
 
 def test_time_inputs_default_none(make_app) -> None:
-    """TC-screen-input-01: ô giờ mặc định trống (không nhập giờ)."""
+    """TC-screen-input-01: web UI chỉ chọn ngày, không có ô giờ / múi giờ (A17)."""
     at = make_app().run()
-    assert at.time_input(key="start_time").value is None
-    assert at.time_input(key="end_time").value is None
+    assert len(at.time_input) == 0
+    assert not [s for s in at.selectbox if s.key == "tz"]
+    assert at.session_state["start_time"] is None and at.session_state["tz"] == "Asia/Bangkok"
 
 
 # ---------- TC-24: bổ sung theo review ----------
@@ -538,7 +539,7 @@ def test_canonical_timezone(make_app, s14: Path, tmp_path: Path) -> None:
     cfg.write_text("timezone: singapore\n", encoding="utf-8")
     at.text_input(key="config_path").set_value(str(cfg)).run()
     at.button(key="load_config").click().run()
-    assert at.selectbox(key="tz").value == "Singapore"
+    assert at.session_state["tz"] == "Singapore"
     (ctx, _, err), = at.session_state["period_memo"].values()
     assert err is None and ctx.period.start.isoformat() == "2026-01-01T00:00:00+08:00"
     (tmp_path / "bad.yaml").write_text("filters: [\n", encoding="utf-8")
@@ -611,3 +612,29 @@ def test_success_line(make_app, s14: Path) -> None:
     assert any(c.startswith("Thư mục kết quả:") for c in values(at.caption))
     bad = load(make_app(), "does-not-exist-dir")
     assert any(e.startswith(("Không", "Đường dẫn", "Repo", "Nguồn")) for e in values(bad.error))
+
+
+# ---------- TC-25: cách gán tác giả ----------
+def test_attribution_mode_radio(make_app, s14: Path, with_ids: Path, tmp_path: Path) -> None:
+    """TC-screen-input-25: radio chọn cách gán — mặc định, build_request, kết quả cũ, E2E."""
+    modes = app.ATTRIBUTION_MODES
+    assert app.build_request(branch="main", period=None, config=AppConfig(),  # type: ignore[arg-type]
+                             out_root=tmp_path, user_mode="Tất cả user", selected=set(),
+                             exclude_bots=False, separate_users=False).attribution_mode == "line"
+    assert app.build_request(branch="main", period=None, config=AppConfig(),  # type: ignore[arg-type]
+                             out_root=tmp_path, user_mode="Tất cả user", selected=set(),
+                             exclude_bots=False, separate_users=False,
+                             attribution_mode=modes[1]).attribution_mode == "last_commit"
+
+    at = load(make_app(), s14)
+    assert at.radio(key="attribution_mode").value == modes[0]
+    analyze(at)
+    assert at.session_state["result"].data.options.attribution_mode == "line"
+    at.radio(key="attribution_mode").set_value(modes[1]).run()
+    assert app.STALE_NOTE in values(at.info)
+    analyze(at)
+    assert not at.exception and not at.error
+    result = at.session_state["result"]
+    assert result.data.options.attribution_mode == "last_commit"
+    assert (result.data.loc_start, result.data.loc_end) == (10, 20)
+    assert app.STALE_NOTE not in values(at.info)

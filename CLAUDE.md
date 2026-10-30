@@ -3,14 +3,15 @@
 ## Bối cảnh
 - **Spec gốc (nguồn sự thật):** [spec_count_LOC.md](spec_count_LOC.md). Đọc phần liên quan trước mọi việc.
 - **Thư mục gốc project:** thư mục chứa file này (tương ứng `loc-counter/` ở mục 5 của spec). Mọi lệnh `uv`, `pytest` chạy từ đây.
-- **Kế hoạch & trạng thái:** [docs/PLAN.md](docs/PLAN.md) — milestone, danh sách feature, câu hỏi mở, rủi ro kỹ thuật.
+- **Kế hoạch & trạng thái:** [docs/PLAN.md](docs/PLAN.md) — milestone, danh sách feature, rủi ro kỹ thuật.
+- **Câu hỏi mở & quyết định đã chốt:** [docs/DECISIONS.md](docs/DECISIONS.md) (mã Q/D).
 - **Spec xử lý từng chức năng/màn hình:** `docs/specs/` (xem [README](docs/specs/README.md)).
 - **Báo cáo review / test:** `docs/reviews/`, `docs/test-reports/`.
 - Môi trường: Windows 11, git 2.55, **không có `python` trên PATH** → luôn dùng `uv` (`uv sync`, `uv run ...`). uv có sẵn CPython 3.14; project yêu cầu `>=3.11`.
 
 ## Quy tắc bắt buộc (từ spec gốc)
 1. Triển khai theo thứ tự Milestone M1 → M7 (mục 13). Test của milestone hiện tại phải pass trước khi sang milestone kế.
-2. **Không tự ý thay đổi** định nghĩa mục 3 và thuật toán mục 6, 7. Mơ hồ/mâu thuẫn → ghi vào mục "Câu hỏi mở" của PLAN.md và **hỏi người dùng**, không tự quyết.
+2. **Không tự ý thay đổi** định nghĩa mục 3 và thuật toán mục 6, 7. Mơ hồ/mâu thuẫn → ghi vào mục "Câu hỏi mở" của docs/DECISIONS.md và **hỏi người dùng**, không tự quyết.
 3. Giá trị mặc định trong spec là bắt buộc.
 4. Code có type hint, docstring ngắn (tiếng Việt), unit test cho mọi module lõi.
 5. UI, thông báo lỗi, báo cáo: **tiếng Việt**. Tên biến/hàm/file: **tiếng Anh**.
@@ -23,7 +24,7 @@ Hook `.claude/hooks/require-spec.cjs` sẽ chặn mọi lần ghi `src/loc_count
 
 | Bước | Skill | Kết quả |
 |---|---|---|
-| 1. Lập kế hoạch milestone | `/milestone-plan M<n>` | Cập nhật PLAN.md: feature, thứ tự, câu hỏi mở |
+| 1. Lập kế hoạch milestone | `/milestone-plan M<n>` | Cập nhật PLAN.md (feature, thứ tự) và DECISIONS.md (câu hỏi mở) |
 | 2. Viết spec xử lý | `/feature-spec <id>` | `docs/specs/<id>.md`, người dùng duyệt → `approved` |
 | 3. Lập trình | `/feature-implement <id>` | Test (từ TC trong spec) + code, theo đúng spec |
 | 4. Test | `/feature-test <id>\|M<n>\|all\|mandatory` | Chạy pytest, đối chiếu TC ↔ test, báo cáo |
@@ -31,6 +32,8 @@ Hook `.claude/hooks/require-spec.cjs` sẽ chặn mọi lần ghi `src/loc_count
 
 Vòng đời spec: `draft` → `approved` (người dùng duyệt) → `implemented` (test pass) → `reviewed` (review PASS).
 Thay đổi hành vi so với spec đã duyệt → **sửa spec trước** (ghi mục Lịch sử thay đổi), báo người dùng, rồi mới sửa code.
+
+Phản hồi quy trình: lỗi test do spec/skill/agent thiếu được `/feature-test` (bước 5b) ghi vào [docs/process-feedback.md](docs/process-feedback.md). Đề xuất sửa `.claude/` hoặc `CLAUDE.md` phải được người dùng duyệt trước; **không tự sửa**.
 
 Agents: `spec-analyst` (phân tích spec gốc, tìm mơ hồ), `test-engineer` (viết test/fixture repo Git), `code-reviewer` (review độc lập, chỉ đọc + ghi báo cáo).
 

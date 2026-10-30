@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 import json
 import logging
 import os
@@ -28,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+
+class AttributionChoice(enum.StrEnum):
+    """Giá trị `--attribution` (spec attribution 5.10)."""
+
+    LINE = "line"
+    LAST_COMMIT = "last-commit"
+
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
                   pretty_exceptions_show_locals=False)  # traceback không in biến (token)
@@ -315,6 +323,8 @@ def _print_analysis_table(result: AnalysisResult) -> None:
     if opts.separate_users:
         who += " • Xuất riêng từng user"
     typer.echo(f"User: {who}")
+    if opts.attribution_mode == "last_commit":
+        typer.echo("Cách gán tác giả: Theo commit cuối cùng của file")
     commits = sum(r.commits for r in data.user_rows)
     for line in _format_table(["LOC start", "LOC end", "Chênh lệch", "Commit"],
                               [[f"{data.loc_start:,}", f"{data.loc_end:,}",
@@ -407,6 +417,9 @@ def analyze_command(
                                                  help="Xuất riêng zip từng user")] = False,
     exclude_bots: Annotated[bool, typer.Option("--exclude-bots",
                                                help="Loại bot khỏi 'Tất cả user'")] = False,
+    attribution: Annotated[AttributionChoice, typer.Option(
+        "--attribution", help="Cách gán tác giả: line (theo từng dòng) hoặc last-commit "
+        "(theo commit cuối cùng của file)")] = AttributionChoice.LINE,
     config: Annotated[Path | None, typer.Option("--config", help="File config.yaml")] = None,
     identities: Annotated[Path | None, typer.Option("--identities",
                                                     help="File identities.yaml")] = None,
@@ -430,7 +443,10 @@ def analyze_command(
                                                   login_cache=identity.DEFAULT_LOGIN_CACHE)
                 request = AnalysisRequest(branch=chosen, period=period, config=cfg, out_root=out,
                                           users=users, exclude_bots=exclude_bots,
-                                          separate_users=separate_users)
+                                          separate_users=separate_users,
+                                          attribution_mode=("last_commit" if attribution
+                                                            is AttributionChoice.LAST_COMMIT
+                                                            else "line"))
                 result = pipeline.run_analysis(git, request, resolver, progress=_print_progress)
             except (LocCounterError, OSError) as err:
                 if not isinstance(err, PipelineError | SnapshotError):  # pipeline đã log (A9)

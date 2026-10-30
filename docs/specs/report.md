@@ -7,7 +7,7 @@ modules: [src/loc_counter/report.py]
 tests: [tests/test_report.py]
 spec_refs: ["3.3", "3.4", "3.5", "7.5", "8.1", "8.2", "8.3", "9", "10.3", "12", "15", "16"]
 depends_on: [counter, config]
-status: reviewed
+status: implemented
 ---
 
 # Báo cáo Excel, CSV, warnings.csv, manifest
@@ -91,6 +91,7 @@ class ReportOptions:
     selected_users: tuple[str, ...] | None = None   # None = "Tất cả user"
     exclude_bots: bool = False
     separate_users: bool = False
+    attribution_mode: str = "line"      # "line" | "last_commit" (spec attribution 5.10)
 
 @dataclass(frozen=True)
 class ReportData:
@@ -227,7 +228,8 @@ def write_reports(out_dir: Path, data: ReportData,
   "totals": {"loc_start": 0, "loc_end": 0, "loc_delta": 0},
   "cross_check": {"expected_loc_end": 0, "diff_percent": 0.0, "loc_end": 0,
                   "sum_net_code": 0, "threshold_percent": 0.5, "ok": true},
-  "options": {"selected_users": ["…"] | null, "exclude_bots": false, "separate_users": false},
+  "options": {"selected_users": ["…"] | null, "exclude_bots": false, "separate_users": false,
+              "attribution_mode": "line" | "last_commit"},
   "exports": [{"role": "start|end|separate", "file": "<file_name>", "tag": "<tag>" | null,
                "accounts": ["…"] | null, "files": 0, "loc": 0, "cross_check": {…} | null}]
 }
@@ -316,6 +318,7 @@ Fixture: dữ liệu giả dựng tay (`Period` từ `make_period`, `CommitInfo`
 | A11 | Không dùng `pandas` cho báo cáo (CSV bằng module `csv` theo N20; xlsx bằng `openpyxl` trực tiếp để kiểm soát kiểu ô và chuẩn hóa) — không thêm thư viện nào | Theo D40-N20, rủi ro PLAN mục 5 | Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-24 (*) |
 | A12 | (review Minor 2) `\r` trong ô xlsx: openpyxl ghi `\r` thô, trình đọc XML chuẩn hóa thành `\n` → đọc lại khác CSV. Chọn **chủ động đổi `\r\n` / `\r` → `\n` ở xlsx** (kết quả giống nhau với mọi trình đọc; Excel hiển thị xuống dòng như nhau). Loại phương án escape `_x000D_` vì openpyxl đọc lại không giải mã (Excel và openpyxl cho hai giá trị khác nhau). CSV giữ nguyên `\r` | Khuyến nghị | Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-24 (*) |
 | A13 | (review Minor 1) Surrogate lẻ trong chuỗi của manifest (`branch`, `repo` trên POSIX, mẫu lọc trong `config.yaml`) làm `encode("utf-8")` lỗi → `write_manifest` thay bằng `U+FFFD` (cùng quy tắc `clean_text` cho xlsx / CSV), không bọc lỗi thành `ReportError` | Khuyến nghị | Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-24 (*) |
+| A14 | `options.attribution_mode` luôn có trong manifest (`"line"` mặc định). Sheet `Tong_quan` thêm dòng `Cách gán tác giả`: `Theo từng dòng` / `Theo commit cuối cùng của file` | Khuyến nghị (ủy quyền 2026-10-30) |
 
 (*) Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-24 (không chờ xác nhận); có thể đổi lại.
 
@@ -327,3 +330,5 @@ Fixture: dữ liệu giả dựng tay (`Period` từ `make_period`, `CommitInfo`
 | 2026-10-24 | Test pass (TC-01..25, 25 test report; toàn bộ 612), coverage `report.py` 100 % → `implemented` | /feature-test |
 | 2026-10-24 | Sửa theo review (reviews/report-20261024.md, PASS_WITH_NOTES): surrogate trong manifest → U+FFFD (Minor 1, A13); `\r` ở xlsx → `\n` (Minor 2, A12); bỏ ô rỗng sau làm sạch (Nit 1); `compresslevel` từng entry (Nit 2); nhãn "loại trừ bot" ở bảng export, thông báo `out_dir` là file (ghi chú spec 3, 4); TC-03 (độ rộng cột), TC-05, TC-09, TC-10, TC-17, TC-20, TC-25 bổ sung (Minor 4, 5, Nit 4). Hằng / bảng cột nội bộ đổi tên `_…` (Minor 3, không thuộc API mục 3). Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-24 | /feature-review |
 | 2026-10-24 | Test pass sau sửa (25 test report; toàn bộ 612), coverage `report.py` 100 %; review PASS_WITH_NOTES (reviews/report-20261024.md), Minor + Nit 1–5 đã sửa, Nit 6 ghi nhận → `reviewed` | /feature-review |
+| 2026-10-30 | `ReportOptions.attribution_mode`, manifest `options.attribution_mode`, dòng `Cách gán tác giả` ở `Tong_quan` (A14) | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
+| 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |

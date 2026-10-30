@@ -7,7 +7,7 @@ modules: [src/loc_counter/cli.py]
 tests: [tests/test_cli_analyze.py]
 spec_refs: ["3.1", "3.3", "3.5", "8.3", "10.2", "10.3", "11", "12", "15", "16"]
 depends_on: [config, git_repo, snapshot, identity, report, pipeline, cli-users]
-status: reviewed
+status: implemented
 ---
 
 # Lệnh `loc-counter analyze`
@@ -70,6 +70,7 @@ Thành phần trong `cli.py` (dùng lại hàm private của spec `cli-users`: `
 @app.command("analyze")
 def analyze_command(repo, start, end, out, branch=None, start_time=None, end_time=None,
                     tz=None, user: list[str] | None = None, separate_users=False,
+                    attribution: str = "line",
                     exclude_bots=False, config=None, identities=None, token_env=None,
                     json_output=False) -> None:
     """Phân tích LOC trong kỳ, xuất zip + báo cáo vào --out."""
@@ -160,7 +161,7 @@ Thư mục kết quả: <out_dir>
    1. `git = _open_repo(repo, token)`;
    2. `branch = _resolve_branch(git, branch)`;
    3. `resolver = pipeline.make_resolver(git.source, identity_map, token, login_cache=identity.DEFAULT_LOGIN_CACHE)`;
-   4. `request = AnalysisRequest(branch=branch, period=period, config=cfg, out_root=out, users=users, exclude_bots=exclude_bots, separate_users=separate_users)`;
+   4. `request = AnalysisRequest(branch=branch, period=period, config=cfg, out_root=out, users=users, exclude_bots=exclude_bots, separate_users=separate_users, attribution_mode=mode)` với `mode` từ `--attribution` (`line` → `"line"`, `last-commit` → `"last_commit"`; giá trị khác → mã 2 do typer);
    5. `result = pipeline.run_analysis(git, request, resolver, progress=_print_progress)`;
    6. mọi `LocCounterError` / `OSError` ném ra trong khối `with` (3.1–3.5) **trừ** `PipelineError` và `SnapshotError` (pipeline đã tự log ERROR: `_error`, `prepare_period`, `logger.exception` từ bước 9 — spec `pipeline` mục 7) → `logger.error("Lỗi: %s", err)` (logger `loc_counter.cli`) **trước khi rời `with`** để `run.log` luôn có nguyên nhân (mở repo, nhánh, `GitError` trước bước 9 của pipeline); lỗi khác ném giữa chừng có thể có hai dòng ERROR (traceback của pipeline + dòng của CLI) — chấp nhận; rồi ném tiếp (A9).
 4. Ngoài `with`: bắt `LocCounterError` / `OSError` từ bước 2–3 → `raise _fail(err)` (mã 1, `Lỗi: <str(err)>`); `KeyboardInterrupt` → stderr `Đã hủy phân tích.`, `typer.Exit(130)`.
@@ -237,6 +238,7 @@ Fixture: `section14_repo` (tham số `name="repo"` để thư mục là `repo_�
 | TC-cli-analyze-21 | Giờ + múi giờ | `--start-time 08:30 --tz UTC` | dòng `Kỳ: 2026-01-01 08:30:00 → 2026-01-31 23:59:59 (UTC)`; thư mục `repo_main_2026-01-01T0830_2026-01-31_all`; `manifest.timezone == "UTC"` | integration |
 | TC-cli-analyze-22 | Lỗi bất thường / Ctrl+C | monkeypatch `pipeline.run_analysis` ném (a) `OSError("đĩa đầy")`, (b) `KeyboardInterrupt`; (c) `_open_repo` ném `GitError`; (d) `--json`, `manifest.json` bị xóa sau `run_analysis` | (a) mã 1, `Lỗi: đĩa đầy`; (b) mã 130, `Đã hủy phân tích.`; (c) mã 1, `run.log` có dòng ERROR chứa thông báo; (d) mã 1, `Lỗi: Không đọc được manifest.json:`, không traceback; `app.pretty_exceptions_show_locals is False` | unit |
 | TC-cli-analyze-23 | Tham số truyền cho pipeline | spy `make_resolver`, `run_analysis` | `login_cache == identity.DEFAULT_LOGIN_CACHE` (đã monkeypatch); `AnalysisRequest.users` = `None` khi không `--user`, `("bob","alice")` theo thứ tự nhập khi có; `exclude_bots`, `separate_users`, `out_root`, `branch` đúng; `progress` khác None; không trường nào của request chứa token | unit |
+| TC-cli-analyze-26 | `--attribution` (A19) | spy `run_analysis`: (a) không tham số → `"line"`; (b) `--attribution last-commit` → `"last_commit"`, stdout có dòng `Cách gán tác giả:`; (c) `--attribution x` → mã 2 | CliRunner |
 | TC-cli-analyze-24 | Định dạng số | `_signed(0)`, `_signed(1234)`, `_signed(-5)`; bảng có giá trị ≥ 1.000 (monkeypatch `run_analysis` trả `AnalysisResult` giả) | `"0"`, `"+1,234"`, `"-5"`; cột số căn phải, có dấu phẩy hàng nghìn; dòng `Cảnh báo: 0` khi không có cảnh báo; biến thể `languages` rỗng → dòng `Không có file source nào.` | unit |
 
 Phủ mandatory-tests mục E (đủ file, `run.log`, tên thư mục / user-tag, token, tái lập): TC-01..05, 13, 18; tiêu chí M5 số 2 (`analyze` trên repo §14): TC-01..04; số 8 (mã lỗi): TC-08..11.
@@ -255,6 +257,7 @@ Phủ mandatory-tests mục E (đủ file, `run.log`, tên thư mục / user-tag
 | A9 | Lỗi nghiệp vụ trong `run_log` mà pipeline **chưa** log (mở repo, nhánh, `GitError` trước bước 9, `OSError`…) được CLI log một dòng ERROR để `run.log` luôn có nguyên nhân; `PipelineError`, `SnapshotError` pipeline đã log ERROR → CLI không log lại (tránh lặp 2–3 dòng, review 2026-10-25) | Khuyến nghị (sửa theo review) | Chốt (*) |
 | A11 | `--json` đọc lại `manifest.json` lỗi → mã 1 `Lỗi: Không đọc được manifest.json: …` thay vì traceback (theo A5) | Khuyến nghị review | Chốt (*) |
 | A12 | `pretty_exceptions_show_locals=False` tường minh: typer cũ (mặc định bật) in biến cục bộ trong traceback → lộ token | Khuyến nghị review | Chốt (*) |
+| A19 | Tham số `--attribution [line\|last-commit]` (mặc định `line`): cách gán tác giả (spec `attribution` 5.10); in thêm dòng `Cách gán tác giả: Theo commit cuối cùng của file` ở bảng kết quả khi `last-commit`. TC-cli-analyze-26 | Khuyến nghị (ủy quyền 2026-10-30) |
 | A10 | Cảnh báo chỉ in số lượng (+ trỏ `warnings.csv`); chi tiết trong `--json` | Khuyến nghị, theo §10.3 "⚠ 12 cảnh báo" | Chốt (*) |
 
 (*) Chốt theo khuyến nghị, người dùng ủy quyền 2026-10-23 ("trường hợp có hỏi xác nhận thì thực hiện theo recommend"); có thể đổi lại.
@@ -264,3 +267,5 @@ Phủ mandatory-tests mục E (đủ file, `run.log`, tên thư mục / user-tag
 |---|---|---|
 | 2026-10-25 | Theo review `reviews/cli-analyze-20261025.md`: 5.3.6 / A9 không log lại `PipelineError`, `SnapshotError`; 5.5 + A11 lỗi đọc `manifest.json` khi `--json`; mục 8 + A12 `pretty_exceptions_show_locals=False`; TC-08, 10, 20, 22, 24 thêm biến thể. Chốt theo khuyến nghị, người dùng ủy quyền | review PASS_WITH_NOTES (Minor 1–4) |
 | 2026-10-24 | Tạo mới theo PLAN M5 (phạm vi `cli-analyze`, D40-N19, N22) và API spec `pipeline` mục 3. A1–A10 chốt theo khuyến nghị, người dùng ủy quyền → `approved` | M5 (`/feature-spec cli-analyze`) |
+| 2026-10-30 | Thêm `--attribution line|last-commit` (A19, TC-26) | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
+| 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |

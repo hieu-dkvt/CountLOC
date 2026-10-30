@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import re
+import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -1764,3 +1766,546 @@ def test_positional_construction_compat() -> None:
     pa2 = PeriodAttribution(None, sha, (fa,), (), {sha: A}, (), (stats,))
     assert pa2.commit(sha) == stats
     assert pa2.commit(_sha("c")) is None
+
+
+# ---------- TC-44 .. TC-46: bộ nhớ đệm và gom blame cho D23 (R19, mục 5.6a) ----------
+def build_merge_multi_delete(src: Any, n: int = 4, fork_before: bool = False) -> None:
+    """TC-44..46: bob xóa n dòng liền kề (v2..) trên feat, alice sửa v8 trên main, carol merge.
+
+    x0 (admin, 2025-12-01) app.py = value_number_0..9; C_START (admin, 2025-12-15) chỉ sửa
+    other.py; feat tách từ C_START (hoặc x0 nếu fork_before); alice 2026-01-05 trên main, bob
+    2026-01-06 trên feat, carol merge --no-ff 2026-01-07 (parent đầu = main).
+    """
+    x0 = src.commit("admin0", "2025-12-01T10:00:00+07:00", files={"app.py": j(VALUES)})
+    cs = src.commit("admin1", "2025-12-15T10:00:00+07:00", files={"other.py": "o = 1\n"})
+    src.git("branch", "feat", x0 if fork_before else cs)
+    main = list(VALUES)
+    main[8] = "value_number_8 = 88"
+    src.commit("alice main", "2026-01-05T10:00:00+07:00", author=ALICE, files={"app.py": j(main)})
+    src.checkout("feat")
+    src.commit("bob feat", "2026-01-06T10:00:00+07:00", author=BOB,
+               files={"app.py": j(VALUES[:2] + VALUES[2 + n:])})
+    src.checkout("main")
+    src.merge("feat", "carol merge", "2026-01-07T10:00:00+07:00", author=CAROL)
+
+
+def assert_multi_delete(result: PeriodAttribution, n: int) -> None:
+    app = file_of(result, "app.py")
+    assert hunk_tuples(app) == [(2, n, 2, 0), (8, 1, 8 - n, 1)]
+    assert dict(app.deleted_by) == {**{2 + k: B for k in range(n)}, 8: A}
+    assert dict(app.added_by) == {8 - n: A}
+    carol = user_of(result, C)
+    assert (carol.added_lines, carol.deleted_lines) == (0, 0)
+    assert carol.files == ()
+    assert result.warnings == ()
+
+
+class _NoStore(dict):
+    """dict không lưu gì: tắt bộ nhớ đệm để so với bản không tối ưu (TC-46)."""
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        pass
+
+
+_CACHE_ATTRS = ("_anc_cache", "_bases_cache", "_fca_cache", "_blame_cache")
+
+
+def disable_optimizations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tắt làm nóng gom blame và mọi bộ nhớ đệm của mục 5.6a (resolve_merge vẫn có memo cũ)."""
+    orig_init = attribution._Attributor.__init__
+
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        orig_init(self, *args, **kwargs)
+        for name in _CACHE_ATTRS:
+            setattr(self, name, _NoStore())
+
+    monkeypatch.setattr(attribution._Attributor, "__init__", init)
+    monkeypatch.setattr(attribution._Attributor, "_warm_merge", lambda *a, **k: None)
+
+
+@pytest.mark.parametrize("fork_before", [False, True])
+def test_merge_pure_queries_cached(make_repo, cache_root: Path, fork_before: bool) -> None:
+    """TC-attribution-44: is_ancestor / merge_bases / first_commit_after không lặp cùng tham số."""
+    src = make_repo()
+    build_merge_multi_delete(src, n=4, fork_before=fork_before)
+    ctx = prepare(src, cache_root)
+    seen: dict[str, list[Any]] = {"is_ancestor": [], "merge_bases": [], "first_commit_after": []}
+    for name in seen:
+        real = getattr(ctx.repo, name)
+
+        def spy(*args: Any, _real: Any = real, _log: list[Any] = seen[name]) -> Any:
+            _log.append(tuple(tuple(a) if isinstance(a, list) else a for a in args))
+            return _real(*args)
+
+        setattr(ctx.repo, name, spy)
+    result = ctx.attribute()
+
+    assert_multi_delete(result, 4)
+    assert seen["is_ancestor"], "kịch bản phải đi qua D23"
+    for name, calls in seen.items():
+        assert len(calls) == len(set(calls)), f"{name} bị gọi lặp: {calls}"
+
+
+def test_error_not_memoized() -> None:
+    """TC-attribution-44: GitError không được ghi nhớ — lần gọi sau vẫn hỏi lại repo."""
+    from loc_counter.git_repo import GitError
+
+    class Flaky(FakeRepo):
+        def is_ancestor(self, a: str, b: str) -> bool:
+            self.calls.append("is_ancestor")
+            if self.calls.count("is_ancestor") == 1:
+                raise GitError("lỗi giả")
+            return True
+
+    anchor = (_sha("a"), "app.py", 3)
+    parent = _sha("p")
+    repo = Flaky(blames=[[BlameLine(3, _sha("p"), 3, "app.py", False)]])
+    att = _attributor(repo)
+    with pytest.raises(GitError):
+        att._parent_side(anchor, parent, 1)
+    assert att._parent_side(anchor, parent, 1) == attribution._PRESENT
+    assert repo.calls.count("is_ancestor") == 2
+
+
+def test_merge_blame_batched(make_repo, cache_root: Path) -> None:
+    """TC-attribution-45: số lệnh blame không tỷ lệ theo số dòng xóa trong merge."""
+    counts: dict[int, int] = {}
+    d23_ranges: dict[int, list[int]] = {}
+    for n in (1, 4):
+        src = make_repo(f"src{n}")
+        build_merge_multi_delete(src, n=n, fork_before=True)
+        ctx = prepare(src, cache_root / f"n{n}")
+        spy = BlameSpy(ctx.repo)
+        result = ctx.attribute()
+        assert_multi_delete(result, n)
+        counts[n] = len(spy.calls)
+        # blame của D23: không kết thúc ở C_END (xuôi tới L, ngược trên parent)
+        d23_ranges[n] = [sum(e - s for s, e in c["line_ranges"])
+                         for c in spy.calls if c["end"] != ctx.snaps.c_end.sha]
+    assert counts[4] == counts[1], counts
+    assert d23_ranges[4], "kịch bản phải đi qua D23"
+    assert max(d23_ranges[4]) >= 4, d23_ranges
+
+
+def test_optimizations_do_not_change_result(make_repo, cache_root: Path,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-46: kết quả bằng nhau khi tắt bộ nhớ đệm + làm nóng; bản tắt gọi git nhiều."""
+    builders: list[tuple[str, Callable[[Any], Any]]] = [
+        ("tc11", build_merge_parallel),
+        ("tc12", lambda s: build_merge_parallel(s, fork_before=True)),
+        ("tc13", build_merge_self_delete),
+        ("tc14", build_conflict),
+        ("tc36", build_nested_merge),
+        ("tc44a", lambda s: build_merge_multi_delete(s, n=4)),
+        ("tc44b", lambda s: build_merge_multi_delete(s, n=4, fork_before=True)),
+        ("mixed", lambda s: build_mixed_born_after_base(s)),
+        ("nested_multi", lambda s: build_nested_multi(s)),
+        ("back_merge", lambda s: build_back_merge(s)),
+    ]
+    fast: dict[str, PeriodAttribution] = {}
+    fast_calls: dict[str, int] = {}
+    ctxs: dict[str, Ctx] = {}
+    for name, build in builders:
+        src = make_repo(name)
+        build(src)
+        ctxs[name] = prepare(src, cache_root / name)
+        spy = BlameSpy(ctxs[name].repo)
+        fast[name] = ctxs[name].attribute()
+        fast_calls[name] = len(spy.calls)
+
+    with monkeypatch.context() as mp:
+        disable_optimizations(mp)
+        for name, _ in builders:
+            ctx = ctxs[name]
+            spy = BlameSpy(ctx.repo)
+            slow = ctx.attribute()
+            assert slow == fast[name], f"{name}: kết quả khác khi tắt tối ưu"
+            assert len(spy.calls) >= fast_calls[name]
+            if name in ("tc44a", "tc44b"):
+                assert len(spy.calls) > fast_calls[name], name
+
+
+# ---------- TC-47: song song theo file (R20, mục 5.1a) ----------
+def build_many_files(src: Any) -> None:
+    """TC-47: 6 file; alice sửa f0..f2 trên main, bob xóa dòng f3, f4 và sửa f5 trên feat, carol
+    merge — nhiều cặp file để thật sự chạy song song, có dòng xóa đi qua merge (D23)."""
+    files = {f"f{k}.py": j([f"{v}  # file {k}" for v in VALUES]) for k in range(6)}
+    src.commit("admin", "2025-12-15T10:00:00+07:00", files=files)
+    src.git("branch", "feat")
+    main = {f"f{k}.py": j([f"{v}  # file {k}" for v in VALUES[:7]] + [f"alice_{k} = {k}"])
+            for k in range(3)}
+    src.commit("alice main", "2026-01-05T10:00:00+07:00", author=ALICE, files=main)
+    src.checkout("feat")
+    feat = {f"f{k}.py": j([f"{v}  # file {k}" for i, v in enumerate(VALUES) if i not in (2, 3)])
+            for k in (3, 4)}
+    feat["f5.py"] = j([f"{v}  # file 5" for v in VALUES] + ["bob_line = 5"])
+    src.commit("bob feat", "2026-01-06T10:00:00+07:00", author=BOB, files=feat)
+    src.checkout("main")
+    src.merge("feat", "carol merge", "2026-01-07T10:00:00+07:00", author=CAROL)
+
+
+def test_parallel_equals_serial(make_repo, section14_repo, cache_root: Path,
+                                monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-47: (a) ATTRIBUTION_WORKERS = 1 và = 4 cho PeriodAttribution bằng nhau."""
+    builders: list[tuple[str, Callable[[Any], Any]]] = [
+        ("tc11", build_merge_parallel), ("tc14", build_conflict),
+        ("tc16", build_move_cross_file), ("tc17", build_move_block),
+        ("tc36", build_nested_merge), ("tc44", lambda s: build_merge_multi_delete(s, n=4)),
+        ("mixed", build_mixed_born_after_base), ("nested_multi", build_nested_multi),
+        ("many", build_many_files),
+    ]
+    ctxs = [prepare(section14_repo().src, cache_root / "s14")]
+    for name, build in builders:
+        src = make_repo(name)
+        build(src)
+        # thêm một file phụ đổi trong kỳ: mọi repo có ≥ 2 entry → thật sự chạy song song
+        src.commit("alice extra", "2026-01-20T10:00:00+07:00", author=ALICE,
+                   files={"zz_extra.py": "extra = 1\n"})
+        ctxs.append(prepare(src, cache_root / name))
+    for ctx in ctxs:
+        entries = ctx.repo.diff_tree(ctx.snaps.c_start.sha if ctx.snaps.c_start else None,
+                                     ctx.snaps.c_end.sha).entries
+        assert len(entries) >= 2, ctx.repo.source
+        monkeypatch.setattr(attribution, "ATTRIBUTION_WORKERS", 1)
+        serial = ctx.attribute()
+        monkeypatch.setattr(attribution, "ATTRIBUTION_WORKERS", 4)
+        parallel = ctx.attribute()
+        assert parallel == serial
+    many = file_of(parallel, "f3.py")
+    assert dict(many.deleted_by) == {2: B, 3: B}
+    assert len(parallel.files) == 7  # f0..f5 + zz_extra.py
+
+
+def test_parallel_error_order(make_repo, cache_root: Path,
+                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-47: (b) file thứ 2 và thứ 4 lỗi → ném lỗi của file thứ 2 (thứ tự entries)."""
+    import time as _time
+
+    from loc_counter.git_repo import GitError
+
+    src = make_repo()
+    build_many_files(src)
+    ctx = prepare(src, cache_root)
+    entries = ctx.repo.diff_tree(ctx.snaps.c_start.sha, ctx.snaps.c_end.sha).entries
+    second, fourth = entries[1], entries[3]
+    real = ctx.repo.diff_hunks
+
+    def fake(old_sha: str, new_sha: str) -> list[Hunk]:
+        if new_sha == second.new_sha:
+            _time.sleep(0.3)  # lỗi của file thứ 4 xảy ra trước về thời gian
+            raise GitError(f"hỏng {second.path}")
+        if new_sha == fourth.new_sha:
+            raise GitError(f"hỏng {fourth.path}")
+        return real(old_sha, new_sha)
+
+    ctx.repo.diff_hunks = fake  # type: ignore[method-assign]
+    monkeypatch.setattr(attribution, "ATTRIBUTION_WORKERS", 4)
+    with pytest.raises(GitError, match=f"hỏng {re.escape(second.path)}$"):
+        ctx.attribute()
+
+
+def test_parallel_context_propagated(make_repo, cache_root: Path,
+                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-47: (c) task chạy ở luồng loc-attr* và thấy ContextVar của luồng gọi."""
+    import contextvars
+    import threading
+
+    marker: contextvars.ContextVar[str] = contextvars.ContextVar("tc47_marker")
+    src = make_repo()
+    build_many_files(src)
+    ctx = prepare(src, cache_root)
+    seen: list[tuple[str | None, str]] = []
+    real = ctx.repo.blame
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append((marker.get(None), threading.current_thread().name))
+        return real(*args, **kwargs)
+
+    ctx.repo.blame = spy  # type: ignore[method-assign]
+    monkeypatch.setattr(attribution, "ATTRIBUTION_WORKERS", 4)
+    token = marker.set("phiên-47")
+    try:
+        ctx.attribute()
+    finally:
+        marker.reset(token)
+    assert seen
+    assert {value for value, _ in seen} == {"phiên-47"}
+    assert any(name.startswith("loc-attr") for _, name in seen)
+
+
+# ---------- TC-48: memo không giữ kết quả bị cắt độ sâu; thứ tự lười; nhánh làm nóng ----------
+EXTRA = [f"extra_line_number_{k} = {k}" for k in range(3)]
+
+
+def build_mixed_born_after_base(src: Any) -> None:
+    """TC-48 (c): feat tách từ x0; C_START thêm 3 dòng extra (sinh sau merge-base); bob xóa v2, v3
+    trên feat; carol merge (tự giải quyết) xóa luôn 3 dòng extra; alice sửa v8 trên main."""
+    src.commit("admin0", "2025-12-01T10:00:00+07:00", files={"app.py": j(VALUES)})
+    src.git("branch", "feat")
+    cs_lines = VALUES[:5] + EXTRA + VALUES[5:]
+    src.commit("admin1", "2025-12-15T10:00:00+07:00", files={"app.py": j(cs_lines)})
+    main = list(cs_lines)
+    main[main.index(VALUES[8])] = "value_number_8 = 88"
+    src.commit("alice main", "2026-01-05T10:00:00+07:00", author=ALICE, files={"app.py": j(main)})
+    src.checkout("feat")
+    src.commit("bob feat", "2026-01-06T10:00:00+07:00", author=BOB,
+               files={"app.py": j([v for v in VALUES if v not in (VALUES[2], VALUES[3])])})
+    src.checkout("main")
+    with contextlib.suppress(subprocess.CalledProcessError):  # xung đột: tự giải quyết bên dưới
+        src.git("merge", "--no-ff", "--no-commit", "feat", date="2026-01-07T10:00:00+07:00",
+                author=CAROL)
+    src.write("app.py", j([v for v in main if v not in (VALUES[2], VALUES[3]) and v not in EXTRA]))
+    src.git("add", "app.py")
+    src.git("commit", "-q", "-m", "carol merge", date="2026-01-07T10:00:00+07:00", author=CAROL)
+
+
+def build_nested_multi(src: Any) -> None:
+    """TC-48 (c): như TC-36 nhưng bob xóa v2..v4 ở hai file app.py, lib.py (song song + nhiều dòng
+    hội tụ ở độ sâu 2)."""
+    src.commit("admin", "2025-12-15T10:00:00+07:00",
+               files={"app.py": j(VALUES), "lib.py": j([f"lib_{v}" for v in VALUES])})
+    src.git("branch", "feat")
+    src.git("branch", "feat2")
+    main = list(VALUES)
+    main[6] = "value_number_6 = 66"
+    src.commit("alice main", "2026-01-04T10:00:00+07:00", author=ALICE, files={"app.py": j(main)})
+    src.checkout("feat")
+    feat = list(VALUES)
+    feat[9] = "value_number_9 = 99"
+    src.commit("bob feat", "2026-01-05T10:00:00+07:00", author=BOB,
+               files={"app.py": j(feat), "lib.py": j([f"lib_{v}" for v in feat])})
+    src.checkout("feat2")
+    keep = [v for i, v in enumerate(VALUES) if i not in (2, 3, 4)]
+    src.commit("bob del", "2026-01-06T09:00:00+07:00", author=BOB,
+               files={"app.py": j(keep), "lib.py": j([f"lib_{v}" for v in keep])})
+    src.checkout("feat")
+    src.merge("feat2", "dave merge feat2", "2026-01-06T12:00:00+07:00", author=DAVE)
+    src.checkout("main")
+    src.merge("feat", "carol merge", "2026-01-07T10:00:00+07:00", author=CAROL)
+
+
+def build_back_merge(src: Any) -> dict[str, str]:
+    """TC-48 (b): alice xóa v2 trên main, bob sửa v9 trên feat, carol merge feat vào main."""
+    src.commit("admin", "2025-12-15T10:00:00+07:00", files={"app.py": j(VALUES)})
+    src.git("branch", "feat")
+    src.commit("alice del v2", "2026-01-05T10:00:00+07:00", author=ALICE,
+               files={"app.py": j([v for v in VALUES if v != VALUES[2]])})
+    src.checkout("feat")
+    feat = list(VALUES)
+    feat[9] = "value_number_9 = 99"
+    feat_tip = src.commit("bob feat", "2026-01-06T10:00:00+07:00", author=BOB,
+                          files={"app.py": j(feat)})
+    src.checkout("main")
+    merge = src.merge("feat", "carol merge", "2026-01-07T10:00:00+07:00", author=CAROL)
+    return {"feat_tip": feat_tip, "merge": merge}
+
+
+def test_depth_truncated_not_memoized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-48: (a) kết quả chạm MAX_MERGE_DEPTH không vào memo; độ sâu lớn → tính lại."""
+    p, q = _sha("p"), _sha("q")
+    att = _attributor(FakeRepo(), merge_parents=(p,))
+    when = datetime(2026, 1, 5, tzinfo=UTC)
+    att.by_sha[_sha("n")] = LogCommit(_sha("n"), (q,), "dave", "d@x", "dave", "d@x", when)
+    nested = (_sha("b"), "app.py", 1)
+    att._locate = (  # type: ignore[method-assign]
+        lambda anchor, parent: (nested, _sha("n")) if parent == p else _sha("x"))
+    anchor = (_sha("a"), "app.py", 3)
+    monkeypatch.setattr(attribution, "MAX_MERGE_DEPTH", 1)
+    assert att.resolve_merge(anchor, _sha("m"), 1) == attribution._UNDETERMINED
+    assert att._memo == {}
+    monkeypatch.setattr(attribution, "MAX_MERGE_DEPTH", 64)
+    assert att.resolve_merge(anchor, _sha("m"), 1) == _sha("x")
+    assert att._memo[(*anchor, _sha("m"))] == _sha("x")
+
+
+def test_lazy_parent_order(make_repo, cache_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-48: (b) dòng xóa ở parent đầu → không blame parent thứ hai (thứ tự lười)."""
+    src = make_repo()
+    shas = build_back_merge(src)
+    ctx = prepare(src, cache_root)
+    merges: list[str] = []
+    real_resolve = attribution._Attributor.resolve_merge
+
+    def resolve_spy(self: Any, anchor: Any, merge: str, depth: int) -> str:
+        merges.append(merge)
+        return real_resolve(self, anchor, merge, depth)
+
+    monkeypatch.setattr(attribution._Attributor, "resolve_merge", resolve_spy)
+
+    def feat_lines(spy: BlameSpy) -> int:
+        """Tổng số dòng được blame trên parent thứ hai (đầu feat)."""
+        return sum(e - s for c in spy.calls if c["end"] == shas["feat_tip"]
+                   for s, e in c["line_ranges"])
+
+    spy = BlameSpy(ctx.repo)
+    result = ctx.attribute()
+    fast_lines = feat_lines(spy)
+    ctx.repo.blame = spy._orig  # type: ignore[method-assign]
+    with monkeypatch.context() as mp:
+        disable_optimizations(mp)
+        slow_spy = BlameSpy(ctx.repo)
+        ctx.attribute()
+    app = file_of(result, "app.py")
+    assert app.deleted_by.get(2) == A  # v2: có kết quả ngay ở parent đầu (main)
+    assert app.deleted_by.get(9) == B  # v9: còn ở parent đầu → xét parent thứ hai
+    assert shas["merge"] in merges, "kịch bản phải đi qua D23"
+    assert fast_lines == feat_lines(slow_spy) > 0  # không làm nóng thừa v2 trên feat
+
+
+@pytest.mark.parametrize("method", ["_is_ancestor", "_merge_bases", "_first_after",
+                                    "_line_blame"])
+def test_error_not_memoized_all(method: str) -> None:
+    """TC-attribution-44: GitError không được ghi nhớ ở cả 4 truy vấn có bộ nhớ đệm."""
+    from loc_counter.git_repo import GitError
+
+    class Flaky(FakeRepo):
+        def _once(self, value: Any) -> Any:
+            self.calls.append("call")
+            if self.calls.count("call") == 1:
+                raise GitError("lỗi giả")
+            return value
+
+        def is_ancestor(self, a: str, b: str) -> bool:
+            return self._once(True)
+
+        def merge_bases(self, a: str, b: str) -> list[str]:
+            return self._once([_sha("b")])
+
+        def first_commit_after(self, since: str, until: str, paths: Any) -> str | None:
+            return self._once(_sha("c"))
+
+        def blame(self, *args: Any, **kwargs: Any) -> list[Any]:
+            return self._once([BlameLine(3, _sha("p"), 3, "app.py", False)])
+
+    repo = Flaky()
+    att = _attributor(repo)
+    args: dict[str, tuple[Any, ...]] = {
+        "_is_ancestor": (_sha("a"), _sha("p")), "_merge_bases": (_sha("a"), _sha("p")),
+        "_first_after": (_sha("a"), _sha("p"), ["app.py"]),
+        "_line_blame": (_sha("p"), "app.py", _sha("a"), 3)}
+    kwargs = {"reverse": True} if method == "_line_blame" else {}
+    with pytest.raises(GitError):
+        getattr(att, method)(*args[method], **kwargs)
+    getattr(att, method)(*args[method], **kwargs)
+    getattr(att, method)(*args[method], **kwargs)  # lần 3: lấy từ bộ nhớ đệm
+    assert repo.calls.count("call") == 2
+
+
+# ---------- TC-49 .. TC-50: mode last_commit (R21, mục 5.10) ----------
+def attribute_last(ctx: Ctx, commits: list[LogCommit] | None = None,
+                   filters: FilterConfig | None = None) -> PeriodAttribution:
+    return attribute_period(ctx.repo, ctx.snaps, ctx.commits if commits is None else commits,
+                            AccountResolver(), filters or FilterConfig(), mode="last_commit")
+
+
+def test_last_commit_section14(section14_repo, cache_root: Path,
+                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-49: §14 — app.py thuộc bob (người sửa cuối); không blame/merge-base."""
+    s14 = section14_repo()
+    ctx = prepare(s14.src, cache_root)
+
+    def forbidden(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("mode last_commit không được gọi lệnh này")
+
+    for name in ("blame", "merge_bases", "is_ancestor"):
+        monkeypatch.setattr(ctx.repo, name, forbidden)
+    result = attribute_last(ctx)
+
+    app = file_of(result, "app.py")
+    assert app.granularity == "last"
+    assert app.last_touch_by == B
+    assert hunk_tuples(app) == [(2, 2, 2, 0), (13, 1, 11, 0), (15, 0, 12, 7)]
+    assert dict(app.added_by) == {i: B for i in range(12, 19)}
+    assert dict(app.deleted_by) == {2: B, 3: B, 13: B}
+    assert set(app.added_commit.values()) == set(app.deleted_commit.values()) != set()
+    util = file_of(result, "util.py")
+    assert util.granularity == "last" and util.last_touch_by == B
+    assert dict(util.added_by) == {i: B for i in range(8)}
+
+    alice, bob = user_of(result, A), user_of(result, B)
+    assert (alice.added_code, alice.deleted_code, alice.added_lines, alice.files) == (0, 0, 0, ())
+    assert (bob.added_code, bob.deleted_code) == (13, 3)
+    assert (bob.added_lines, bob.deleted_lines) == (15, 3)
+    assert bob.files == ("app.py", "util.py")
+    assert result.warnings == ()
+    assert sum(u.added_code - u.deleted_code for u in result.users) == 10  # 10 → 20
+
+
+def test_last_commit_default_mode_unchanged(section14_repo, cache_root: Path) -> None:
+    """TC-attribution-50 (e): mode mặc định = "line" — kết quả như attribute_period cũ."""
+    s14 = section14_repo()
+    ctx = prepare(s14.src, cache_root)
+    assert ctx.attribute() == attribute_period(ctx.repo, ctx.snaps, ctx.commits,
+                                               AccountResolver(), FilterConfig(), mode="line")
+    with pytest.raises(ValueError, match="mode"):
+        attribute_period(ctx.repo, ctx.snaps, ctx.commits, AccountResolver(), FilterConfig(),
+                         mode="x")  # type: ignore[arg-type]
+
+
+def test_last_commit_binary(make_repo, cache_root: Path) -> None:
+    """TC-attribution-50 (a): file binary → "last", người sửa cuối, không có dòng."""
+    src = make_repo()
+    src.commit("admin", "2025-12-15T10:00:00+07:00", files={"d.bin": b"\x00\x01\x02" * 10})
+    src.commit("alice", "2026-01-05T10:00:00+07:00", author=ALICE,
+               files={"d.bin": b"\x00\x01\x03" * 10})
+    src.commit("bob", "2026-01-06T10:00:00+07:00", author=BOB,
+               files={"d.bin": b"\x00\x01\x04" * 10})
+    full = FilterConfig(export_mode="full", exclude_binary=False)
+    fa = file_of(attribute_last(prepare(src, cache_root), filters=full), "d.bin")
+    assert fa.granularity == "last"
+    assert fa.last_touch_by == B
+    assert fa.hunks == ()
+    assert dict(fa.added_by) == {} and dict(fa.deleted_by) == {}
+
+
+def test_last_commit_rename(make_repo, cache_root: Path) -> None:
+    """TC-attribution-50 (b): rename + sửa → renamed_by = người sửa cuối (alice)."""
+    src = make_repo()
+    src.commit("admin", "2025-12-15T10:00:00+07:00", files={"old.py": j(VALUES)})
+    src.git("mv", "old.py", "new.py")
+    src.commit("bob mv", "2026-01-05T10:00:00+07:00", author=BOB)
+    src.commit("alice edit", "2026-01-06T10:00:00+07:00", author=ALICE,
+               files={"new.py": j([*VALUES, "alice_line = 1"])})
+    result = attribute_last(prepare(src, cache_root))
+    fa = result.files[0]
+    assert fa.entry.status == "R" and fa.granularity == "last"
+    assert fa.renamed_by == A and fa.last_touch_by == A
+    assert dict(fa.added_by) == {10: A}
+    assert result.warnings == ()
+
+
+def test_last_commit_unknown_account(section14_repo, cache_root: Path) -> None:
+    """TC-attribution-50 (c): commit cuối ngoài danh sách commit → UNATTRIBUTED."""
+    s14 = section14_repo()
+    result = attribute_last(prepare(s14.src, cache_root), commits=[])
+    app = file_of(result, "app.py")
+    assert app.last_touch_by is None
+    assert dict(app.added_by) == {} and dict(app.deleted_by) == {}
+    assert [(w.path, w.kind) for w in result.warnings] == [
+        ("app.py", WarningKind.UNATTRIBUTED), ("util.py", WarningKind.UNATTRIBUTED)]
+
+
+def test_last_commit_empty_start(section14_repo, cache_root: Path) -> None:
+    """TC-attribution-50 (d): C_START rỗng — mọi dòng của file gán cho người sửa cuối."""
+    s14 = section14_repo()
+    result = attribute_last(prepare(s14.src, cache_root, start=date(2025, 12, 1)))
+    app = file_of(result, "app.py")
+    assert app.entry.status == "A"
+    assert set(app.added_by.values()) == {B}
+    assert dict(app.deleted_by) == {}
+    assert user_of(result, B).added_code == 20
+
+
+def test_last_commit_parallel_equals_serial(section14_repo, cache_root: Path,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """TC-attribution-50 (f): song song = tuần tự ở mode last_commit."""
+    s14 = section14_repo()
+    ctx = prepare(s14.src, cache_root)
+
+    def digest(workers: int) -> list[Any]:
+        monkeypatch.setattr(attribution, "ATTRIBUTION_WORKERS", workers)
+        res = attribute_last(ctx)
+        return [(f.path, f.granularity, dict(f.added_by), dict(f.deleted_by), f.last_touch_by)
+                for f in res.files] + [res.users, res.commit_stats]
+
+    assert digest(1) == digest(4)

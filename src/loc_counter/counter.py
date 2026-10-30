@@ -383,7 +383,9 @@ def user_metrics(attribution: PeriodAttribution, summaries: Sequence[UserSummary
     stats = {u.account: u for u in attribution.users}
     changed: dict[str, set[str]] = defaultdict(set)  # account → file source đã thay đổi
     for f in attribution.files:
-        if f.granularity != "lines" or not (_counted_side(f.old) or _counted_side(f.new)):
+        if f.granularity not in ("lines", "last"):
+            continue
+        if not (_counted_side(f.old) or _counted_side(f.new)):
             continue
         touched = {*f.added_by.values(), *f.deleted_by.values()}
         if f.renamed_by is not None:

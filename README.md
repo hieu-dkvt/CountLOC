@@ -58,11 +58,12 @@ Export end khi chọn một hoặc vài user = source tại C_START + **chỉ** 
 ```bash
 uv run loc-counter analyze --repo <URL hoặc đường dẫn> --start 2026-01-01 --end 2026-01-31 \
   --out ./out [--branch main] [--start-time HH:MM] [--end-time HH:MM] [--tz Asia/Bangkok] \
-  [--user alice --user bob] [--separate-users] [--exclude-bots] \
+  [--user alice --user bob] [--separate-users] [--exclude-bots] [--attribution line|last-commit] \
   [--config config.yaml] [--identities identities.yaml] [--token-env GITHUB_TOKEN] [--json]
 ```
 - Không có `--user` = **Tất cả user** (export end = C_END). Nhiều `--user` = một bản gộp các user đó; `--separate-users` thêm một zip riêng cho từng user.
 - `--user` khớp chính xác account, nếu không có thì khớp không phân biệt hoa thường (khi chỉ có đúng một account khớp). Bot được chọn tường minh vẫn được tính dù có `--exclude-bots`; `--exclude-bots` chỉ loại bot khỏi "Tất cả user".
+- `--attribution` chọn cách gán tác giả (cũng là radio "Cách gán tác giả" ở giao diện web): `line` (mặc định) gán từng dòng thêm/xóa cho người viết/xóa dòng đó bằng `git blame`; `last-commit` đơn giản và nhanh hơn: **toàn bộ** thay đổi của một file trong kỳ (dòng thêm, dòng xóa) và bản C_END của file thuộc về **người sửa cuối cùng** file đó. Với `last-commit`, chọn user A chỉ có các file mà A sửa cuối; file người khác sửa cuối giữ bản C_START. Lựa chọn được ghi ở `manifest.json` (`options.attribution_mode`) và sheet `Tong_quan`.
 - Tiến độ (`[1/5] Export start…` … `[5/5] Tạo báo cáo…`) và log in ra stderr; stdout là bảng tóm tắt, hoặc JSON khi có `--json`.
 - Mã thoát: `0` thành công (kể cả có cảnh báo hay kiểm tra chéo lệch), `1` lỗi (thông báo tiếng Việt), `2` sai tham số, `130` khi bấm Ctrl+C.
 

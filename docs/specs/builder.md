@@ -7,7 +7,7 @@ modules: [src/loc_counter/builder.py]
 tests: [tests/test_builder.py]
 spec_refs: ["3.3", "3.4", "3.5", "7.1", "7.3", "7.4", "7.5", "8.3", "9", "12", "14", "15", "16"]
 depends_on: [attribution, snapshot, counter, identity, git_repo]
-status: reviewed
+status: implemented
 ---
 
 # Dựng export end theo user
@@ -173,6 +173,9 @@ Tách nguyên văn từ 5.2 bước 6 (refactor giữ hành vi):
 2. Trả list theo đúng thứ tự trên (không sắp lại; người gọi sắp ổn định `(path, kind)` như 5.2 bước 7). Không có cặp → `[]`. `paths` có thể là iterator bất kỳ, phần tử trùng được bỏ (như `find_path_conflicts`).
 `build_user_export` gọi `path_conflict_warnings(seen, tag)` → kết quả và log trùng hệt bản M4.
 
+### 5.7a Granularity `"last"` (mode `last_commit`, spec `attribution` 5.10)
+`_build_file` xử lý `fa.granularity == "last"` giống `"whole"` (bước 3 của 5.2): bản C_END nếu `fa.last_touch_by` ∈ users, ngược lại bản C_START; tên theo `_chosen_name` (`renamed_by == last_touch_by`). Test: TC-builder-32.
+
 ### 5.8 `windows_path_issues(path)`, `windows_path_warnings(paths)` (M5, D39, A14–A16)
 `windows_path_issues(path)`: tách `path.split("/")`; bỏ qua phần `""`, `"."`, `".."` (thuộc `UNSAFE_PATH`, không bao giờ có trong export). Với từng phần `part` từ trái sang phải, kiểm theo thứ tự và thêm lý do tương ứng:
 1. **Tên thiết bị**: `stem = part.split(".", 1)[0].rstrip(" ")`; `stem.casefold()` thuộc `{con, prn, aux, nul, com0…com9, com¹, com², com³, lpt0…lpt9, lpt¹, lpt², lpt³}` → `"<part>" trùng tên thiết bị dành riêng của Windows (<STEM>)` với `<STEM> = stem.upper()`. Ví dụ `CON`, `nul.py`, `Aux.tar.gz`, `src/com1/x.py`; không phải: `CONSOLE.py`, `COM10.py`, `nul_.py`, `null/x.py`.
@@ -252,6 +255,7 @@ Fixture: `section14_repo`, `make_repo`, các hàm dựng repo trong `tests/test_
 | TC-builder-29 | (M5) `windows_path_warnings` | `["b/NUL.py", "ok.py", "a.py.", "b/NUL.py"]`; `[]` | 2 cảnh báo sắp theo path `a.py.`, `b/NUL.py`; kind `WINDOWS_PATH`; thông báo đúng nguyên văn 5.8; log WARNING; `[]` | unit |
 | TC-builder-30 | (M5) Tích hợp start / `all` (A13, D39) | repo (`update-index --cacheinfo`, không cần file trên đĩa): C_START có `A.py`, `a.py`, `NUL.py`, `src/a.py.`, `ok.py`; alice sửa `NUL.py` trong kỳ; `export_mode: full` | `plan_export(C_START/C_END)` giữ cả 5 file, không `UNSAFE_PATH`; `export_from_plan` không có `PATH_CONFLICT`/`WINDOWS_PATH` (không đổi); `path_conflict_warnings(paths start)` → `A.py`, `a.py`; `windows_path_warnings(paths)` → `NUL.py`, `src/a.py.`; `build_user_export({alice})` có `PATH_CONFLICT` cho `A.py`/`a.py`, **không** có `WINDOWS_PATH`; `write_user_export` ghi được zip chứa `NUL.py` (nội dung C_END) và `src/a.py.` | integration |
 | TC-builder-31 | `BuiltFile` phòng thủ | `BuiltFile("x.py", "100644", None)`; `BuiltFile("x.py", "100644", None, blob_sha="a" * 40, data=b"x")` | cả hai `ValueError` | unit |
+| TC-builder-32 | (mode `last_commit`) Export theo `last_touch_by` | repo §14, `attribute_period(mode="last_commit")`: chỉ alice → `app.py` bản C_START (bob là người sửa cuối), không `util.py`, LOC 10; chỉ bob → `app.py` bản C_END + `util.py`, LOC 20; alice + bob → trùng C_END (20); zip tái lập | integration |
 
 ## 10. Câu hỏi mở / giả định
 | # | Nội dung | Phương án | Trạng thái |
@@ -292,3 +296,5 @@ Fixture: `section14_repo`, `make_repo`, các hàm dựng repo trong `tests/test_
 | 2026-10-24 | Test pass (TC-01..30, 100 test builder; toàn bộ 586) → `implemented` | /feature-test |
 | 2026-10-24 | Sửa theo review (reviews/builder-20261024.md, PASS_WITH_NOTES): thông báo `WINDOWS_PATH` thành "có thể không giải nén đúng" (Minor 1, phương án (a) — chốt theo khuyến nghị, người dùng ủy quyền 2026-10-24); log `path_conflict_warnings` khi `label` rỗng (Nit); TC-31 `BuiltFile` phòng thủ (Nit); A15 ghi kết quả thử Windows 11 và rủi ro `a.py.`/`a.py` (README) | Review builder |
 | 2026-10-24 | Test pass (TC-01..31, 101 test builder; toàn bộ 587), coverage `builder.py` 100 %; review PASS_WITH_NOTES (reviews/builder-20261024.md), Minor 1 + 2 Nit đã sửa → `reviewed` | /feature-review |
+| 2026-10-30 | Granularity `"last"` xử lý như `"whole"` (5.7a, TC-32) | Người dùng yêu cầu lựa chọn "Gán tác giả cho commit cuối cùng" (thuật toán đơn giản). Chốt theo khuyến nghị, người dùng ủy quyền → `approved` | Yêu cầu mới |
+| 2026-10-30 | Test pass (mode last_commit: TC-attribution-49/50, builder-32, pipeline-40, screen-input-25, cli-analyze-26; toàn bộ 779 test, ruff sạch, coverage 99 %) → `implemented`; chưa review | /feature-test |
